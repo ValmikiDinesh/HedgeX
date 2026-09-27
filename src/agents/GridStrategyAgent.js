@@ -45,10 +45,10 @@ class GridStrategyAgent {
           await binanceService.setLeverage(symbol, leverage);
           this.currentLeverage = leverage;
         } catch (err) {
-          console.error(`❌ Leverage update failed. Reverting DB setting to 1x to prevent silent over-leverage crash!`);
-          await BotSettings.updateOne({ singletonId: 'default_settings' }, { $set: { leverage: 1 } });
-          this.currentLeverage = 1;
-          leverage = 1; // FIX: Prevent First-Tick Overleverage Bomb!
+          console.error(`❌ Leverage update failed. Reverting DB setting back to known good state (${this.currentLeverage || 1}x) to prevent margin desync!`);
+          const fallbackLeverage = this.currentLeverage || 1;
+          await BotSettings.updateOne({ singletonId: 'default_settings' }, { $set: { leverage: fallbackLeverage } });
+          leverage = fallbackLeverage;
         }
       }
 
@@ -62,13 +62,31 @@ class GridStrategyAgent {
 
       // 4. Fetch current active positions and orders
       const positions = await binanceService.fetchOpenPositions(symbol);
-      const longPos = positions.find(p => p.info.positionSide === 'LONG');
-      const shortPos = positions.find(p => p.info.positionSide === 'SHORT');
+      let longPos = positions.find(p => p.info.positionSide === 'LONG');
+      let shortPos = positions.find(p => p.info.positionSide === 'SHORT');
       
       const currentPrice = await marketAgent.getCurrentPrice(symbol);
       if (!currentPrice) {
         this.isActive = false;
         return;
+      }
+
+      // --- DUST SWEEPER (Phase 9) ---
+      // Eliminate partial-fill dust ghosts that paralyze the grid with MIN_NOTIONAL spam
+      if (longPos && (Math.abs(parseFloat(longPos.contracts)) * currentPrice) < 5.0) {
+         console.warn(`🧹 Sweeping LONG Dust Position ($${(Math.abs(parseFloat(longPos.contracts)) * currentPrice).toFixed(2)})...`);
+         try {
+             await binanceService.placeHedgeOrder(symbol, 'SELL', 'LONG', Math.abs(parseFloat(longPos.contracts)), 'MARKET');
+             longPos = null; // Clear from memory to immediately replenish a healthy position
+         } catch(e) { console.error('Failed to sweep LONG dust:', e.message); }
+      }
+      
+      if (shortPos && (Math.abs(parseFloat(shortPos.contracts)) * currentPrice) < 5.0) {
+         console.warn(`🧹 Sweeping SHORT Dust Position ($${(Math.abs(parseFloat(shortPos.contracts)) * currentPrice).toFixed(2)})...`);
+         try {
+             await binanceService.placeHedgeOrder(symbol, 'BUY', 'SHORT', Math.abs(parseFloat(shortPos.contracts)), 'MARKET');
+             shortPos = null; 
+         } catch(e) { console.error('Failed to sweep SHORT dust:', e.message); }
       }
       
       // Calculate Notional Size symmetrically based on TOTAL wallet balance (including locked margin)
@@ -76,8 +94,8 @@ class GridStrategyAgent {
       const notionalSize = (balance * positionPercentage) * leverage;
       const quantityRaw = notionalSize / currentPrice;
       
-      // Binance requires $5.00 min notional. Pad it by the grid percentage so Short TP isn't rejected.
-      const minNotional = 5.0 / (1 - gridPercentage);
+      // Binance requires $5.00 min notional. Pad it safely.
+      const minNotional = 5.0 / Math.max(0.1, (1 - gridPercentage));
       const canOpenNewPosition = notionalSize >= minNotional && quantityRaw > 0 && balance > 0 && !isMarginWarning;
       if (!canOpenNewPosition) {
         console.warn(`⚠️ Cannot open new positions: Notional size ($${notionalSize.toFixed(2)}) is below padded Binance minimum of $${minNotional.toFixed(2)} or balance is too low.`);
@@ -248,7 +266,14 @@ class GridStrategyAgent {
           console.log(`📉 Price dropped below grid! Averaging down LONG leg...`);
           try {
             await binanceService.cancelOrdersBySide(symbol, 'LONG');
-            await binanceService.placeHedgeOrder(symbol, 'BUY', 'LONG', quantityRaw, 'MARKET');
+            // Verify position hasn't been closed by exchange right as we cancelled the limit order
+            const verifyPositions = await binanceService.fetchOpenPositions(symbol);
+            const verifyLong = verifyPositions.find(p => p.info.positionSide === 'LONG');
+            if (verifyLong && Math.abs(parseFloat(verifyLong.contracts)) > 0) {
+                await binanceService.placeHedgeOrder(symbol, 'BUY', 'LONG', quantityRaw, 'MARKET');
+            } else {
+                console.warn(`🚨 DCA Aborted! Long position closed right before market order placement.`);
+            }
           } catch (dcaErr) {
             console.error(`❌ Failed to DCA LONG leg:`, dcaErr.message);
           }
@@ -316,7 +341,14 @@ class GridStrategyAgent {
            console.log(`📈 Price pumped above grid! Averaging down SHORT leg...`);
            try {
              await binanceService.cancelOrdersBySide(symbol, 'SHORT');
-             await binanceService.placeHedgeOrder(symbol, 'SELL', 'SHORT', quantityRaw, 'MARKET');
+             // Verify position hasn't been closed by exchange right as we cancelled the limit order
+             const verifyPositions = await binanceService.fetchOpenPositions(symbol);
+             const verifyShort = verifyPositions.find(p => p.info.positionSide === 'SHORT');
+             if (verifyShort && Math.abs(parseFloat(verifyShort.contracts)) > 0) {
+                 await binanceService.placeHedgeOrder(symbol, 'SELL', 'SHORT', quantityRaw, 'MARKET');
+             } else {
+                 console.warn(`🚨 DCA Aborted! Short position closed right before market order placement.`);
+             }
            } catch (dcaErr) {
              console.error(`❌ Failed to DCA SHORT leg:`, dcaErr.message);
            }
@@ -326,7 +358,10 @@ class GridStrategyAgent {
          dbRecord.shortLeg.unrealizedPnl = calculateNetPnl(shortPos.info.unRealizedProfit, parseFloat(shortPos.info.entryPrice), Math.abs(parseFloat(shortPos.contracts)));
       }
 
-      await dbRecord.save();
+      // Only save if the symbol didn't change mid-loop (prevents zombie positions)
+      if (this.currentSymbol === symbol) {
+        await dbRecord.save();
+      }
 
     } catch (err) {
       console.error('❌ Grid Loop Error:', err.message);

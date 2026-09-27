@@ -88,12 +88,13 @@ async function startBot() {
         
         const calculateBreakdown = (pos, currentPrice) => {
           if (!pos) return null;
-          const qty = Math.abs(parseFloat(pos.contracts));
           const entryPrice = parseFloat(pos.info.entryPrice);
+          const safePrice = currentPrice || entryPrice; // Fix: Fallback to prevent NaN
+          const qty = Math.abs(parseFloat(pos.contracts));
           const grossPnl = parseFloat(pos.info.unRealizedProfit || 0);
           
           // Taker fee on entry (0.05%) + Maker fee on limit exit (0.02%)
-          const fees = qty * ((entryPrice * 0.0005) + (currentPrice * 0.0002));
+          const fees = qty * ((entryPrice * 0.0005) + (safePrice * 0.0002));
           const netPnl = grossPnl - fees;
           
           return {
@@ -126,7 +127,10 @@ async function startBot() {
       }
     });
 
+    let isUpdatingSettings = false; // Mutex Lock to prevent Double-Close Bug
     app.post('/api/settings', async (req, res) => {
+      if (isUpdatingSettings) return res.status(429).json({ error: 'Settings update in progress. Please wait.' });
+      isUpdatingSettings = true;
       try {
         const updates = req.body;
         delete updates.singletonId; // SECURITY FIX: Prevent singleton prototype pollution
@@ -159,12 +163,14 @@ async function startBot() {
                console.error('Failed to mark old positions closed during symbol swap', e);
              }
           }
-          Object.assign(settings, updates);
+          settings.set(updates);
         }
         await settings.save();
         res.json(settings);
       } catch (err) {
         res.status(500).json({ error: 'Failed to update settings' });
+      } finally {
+        isUpdatingSettings = false; // Release Mutex
       }
     });
 
