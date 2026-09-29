@@ -9,8 +9,10 @@ const tradeHistorySchema = new mongoose.Schema({
   grossPnl: { type: Number, required: true },
   fees: { type: Number, required: true },
   netPnl: { type: Number, required: true },
-  closedAt: { type: Date, default: Date.now, index: -1 }
+  closedAt: { type: Date, default: Date.now, index: true }
 });
+
+tradeHistorySchema.index({ closedAt: -1 });
 
 const TradeHistory = mongoose.model('TradeHistory', tradeHistorySchema);
 

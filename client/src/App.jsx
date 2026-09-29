@@ -6,10 +6,10 @@ import GridLegCard from './components/GridLegCard';
 import './index.css';
 
 function App() {
-  const [status, setStatus] = useState({ balance: 0, marginRatio: 0 });
+  const [status, setStatus] = useState({ balance: 0, marginRatio: 0, totalRealizedPnl: 0 });
   const [gridData, setGridData] = useState({ livePositions: { long: null, short: null }, livePrice: null });
   const [tradeHistory, setTradeHistory] = useState([]);
-  const [settings, setSettings] = useState({ symbol: 'DOGEUSDT', gridPercentage: 0.015, positionPercentage: 0.20, leverage: 10, tradingEnabled: true });
+  const [settings, setSettings] = useState({ symbol: 'DOGEUSDT', gridPercentage: 0.015, positionPercentage: 0.20, leverage: 10, tradingEnabled: true, maxDcaLayers: 3, stopLossPercentage: 0.05 });
   const [loading, setLoading] = useState(true);
   
   // Modal State
@@ -17,7 +17,8 @@ function App() {
   const [formData, setFormData] = useState({ 
     ...settings,
     gridPercentage: settings.gridPercentage * 100,
-    positionPercentage: settings.positionPercentage * 100
+    positionPercentage: settings.positionPercentage * 100,
+    stopLossPercentage: (settings.stopLossPercentage || 0.05) * 100
   });
   const [saving, setSaving] = useState(false);
 
@@ -43,7 +44,8 @@ function App() {
         setFormData({
           ...settingsRes.data,
           gridPercentage: parseFloat((settingsRes.data.gridPercentage * 100).toFixed(4)),
-          positionPercentage: parseFloat((settingsRes.data.positionPercentage * 100).toFixed(4))
+          positionPercentage: parseFloat((settingsRes.data.positionPercentage * 100).toFixed(4)),
+          stopLossPercentage: parseFloat(((settingsRes.data.stopLossPercentage ?? 0.05) * 100).toFixed(2))
         });
       }
       setLoading(false);
@@ -60,11 +62,17 @@ function App() {
 
   useEffect(() => {
     const socket = io();
-    socket.on('price_update', (price) => {
-      setGridData(prev => ({ ...prev, livePrice: price }));
+    socket.on('price_update', (data) => {
+      if (typeof data === 'object' && data !== null) {
+        if (!data.symbol || data.symbol === settings.symbol) {
+          setGridData(prev => ({ ...prev, livePrice: data.price }));
+        }
+      } else {
+        setGridData(prev => ({ ...prev, livePrice: data }));
+      }
     });
     return () => socket.disconnect();
-  }, []);
+  }, [settings.symbol]);
 
   const handleSaveSettings = async (e) => {
     e.preventDefault();
@@ -73,7 +81,8 @@ function App() {
       const payload = {
         ...formData,
         gridPercentage: formData.gridPercentage / 100,
-        positionPercentage: formData.positionPercentage / 100
+        positionPercentage: formData.positionPercentage / 100,
+        stopLossPercentage: formData.stopLossPercentage !== undefined ? formData.stopLossPercentage / 100 : 0.05
       };
       await axios.post('/api/settings', payload);
       setShowSettings(false);
@@ -107,7 +116,7 @@ function App() {
           <div className="stat-pill">
             <Wallet size={16} className="stat-label" />
             <span className="stat-label">Balance:</span>
-            <span className="stat-value">${parseFloat(status.balance).toFixed(2)}</span>
+            <span className="stat-value">${parseFloat(status?.balance || 0).toFixed(2)}</span>
           </div>
           
           <div className="stat-pill">
@@ -115,6 +124,13 @@ function App() {
             <span className="stat-label">Margin:</span>
             <span className={isMarginSafe ? 'stat-value safe' : 'stat-value danger'}>
               {status.marginRatio}%
+            </span>
+          </div>
+
+          <div className="stat-pill">
+            <span className="stat-label">Total PnL:</span>
+            <span className={`stat-value ${(status.totalRealizedPnl || 0) >= 0 ? 'safe' : 'danger'}`}>
+              {(status.totalRealizedPnl || 0) >= 0 ? '+' : ''}${parseFloat(status?.totalRealizedPnl || 0).toFixed(2)}
             </span>
           </div>
 
@@ -136,11 +152,13 @@ function App() {
               side="LONG" 
               position={gridData.livePositions.long} 
               symbol={settings.symbol}
+              maxDcaLayers={settings.maxDcaLayers ?? 3}
             />
             <GridLegCard 
               side="SHORT" 
               position={gridData.livePositions.short} 
               symbol={settings.symbol}
+              maxDcaLayers={settings.maxDcaLayers ?? 3}
             />
           </div>
         )}
@@ -167,17 +185,17 @@ function App() {
                   </thead>
                   <tbody>
                     {tradeHistory.map((trade, idx) => (
-                      <tr key={idx}>
+                      <tr key={trade._id || idx}>
                         <td>{new Date(trade.closedAt).toLocaleTimeString()}</td>
                         <td>{trade.symbol}</td>
                         <td className={trade.side === 'LONG' ? 'text-green' : 'text-red'}>{trade.side}</td>
-                        <td>${trade.entryPrice.toFixed(5)}</td>
-                        <td>${trade.exitPrice.toFixed(5)}</td>
-                        <td className={trade.grossPnl >= 0 ? 'text-green' : 'text-red'}>
-                          {trade.grossPnl >= 0 ? '+' : ''}{trade.grossPnl.toFixed(4)}
+                        <td>${Number(trade.entryPrice || 0).toFixed(5)}</td>
+                        <td>${Number(trade.exitPrice || 0).toFixed(5)}</td>
+                        <td className={(trade.grossPnl || 0) >= 0 ? 'text-green' : 'text-red'}>
+                          {(trade.grossPnl || 0) >= 0 ? '+' : ''}{Number(trade.grossPnl || 0).toFixed(4)}
                         </td>
-                        <td className={trade.netPnl >= 0 ? 'text-green' : 'text-red'} style={{fontWeight: 'bold'}}>
-                          {trade.netPnl >= 0 ? '+' : ''}{trade.netPnl.toFixed(4)}
+                        <td className={(trade.netPnl || 0) >= 0 ? 'text-green' : 'text-red'} style={{fontWeight: 'bold'}}>
+                          {(trade.netPnl || 0) >= 0 ? '+' : ''}{Number(trade.netPnl || 0).toFixed(4)}
                         </td>
                       </tr>
                     ))}
@@ -247,6 +265,36 @@ function App() {
                   onChange={(e) => setFormData({...formData, leverage: parseInt(e.target.value)})}
                   required
                 />
+              </div>
+
+              <div className="form-group">
+                <label>Max DCA Layers</label>
+                <input 
+                  type="number" 
+                  step="1"
+                  min="0"
+                  max="10"
+                  value={formData.maxDcaLayers ?? 3} 
+                  onChange={(e) => setFormData({...formData, maxDcaLayers: parseInt(e.target.value) || 0})}
+                  placeholder="e.g. 3 (0 to disable DCA)"
+                  required
+                />
+                <small>Maximum safety DCA replenishment layers per position side (0-10).</small>
+              </div>
+
+              <div className="form-group">
+                <label>Position Stop-Loss (%)</label>
+                <input 
+                  type="number" 
+                  step="0.1"
+                  min="0"
+                  max="50"
+                  value={formData.stopLossPercentage} 
+                  onChange={(e) => setFormData({...formData, stopLossPercentage: parseFloat(e.target.value)})}
+                  placeholder="e.g. 5.0 (0 to disable)"
+                  required
+                />
+                <small>Closes losing leg if trend continues past max DCA layers (0 to disable).</small>
               </div>
 
               <div className="form-group checkbox-group" style={{ display: 'flex', alignItems: 'center', gap: '10px', marginTop: '20px', marginBottom: '20px' }}>

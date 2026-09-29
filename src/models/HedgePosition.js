@@ -6,6 +6,10 @@ const legSchema = new mongoose.Schema({
   entryPrice: { type: Number },
   quantity: { type: Number },
   takeProfitPrice: { type: Number },
+  stopLossPrice: { type: Number },
+  dcaCount: { type: Number, default: 0 },
+  lastDcaPrice: { type: Number },
+  reloadPrice: { type: Number },
   unrealizedPnl: { type: Number, default: 0 },
   realizedPnl: { type: Number, default: 0 }
 });

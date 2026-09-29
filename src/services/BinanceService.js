@@ -48,13 +48,28 @@ class BinanceService {
     try {
       const params = { positionSide }; // 'LONG' or 'SHORT'
       
+      // Ensure exchange markets are loaded for precision formatting
+      if (!this.exchange.markets || Object.keys(this.exchange.markets).length === 0) {
+        try {
+          await this.exchange.loadMarkets();
+        } catch (loadErr) {
+          console.warn(`⚠️ Lazy loadMarkets warning:`, loadErr.message);
+        }
+      }
+
       // Format dynamically using Binance's strict precision rules
       const quantity = this.exchange.amountToPrecision(symbol, quantityRaw);
+      if (!quantity || parseFloat(quantity) <= 0) {
+        throw new Error(`Invalid order quantity (${quantityRaw} rounded to ${quantity}) for ${symbol}`);
+      }
       
       let order;
       if (type.toUpperCase() === 'MARKET') {
         order = await this.exchange.createOrder(symbol, 'market', side, quantity, undefined, params);
-      } else if (type.toUpperCase() === 'LIMIT' && priceRaw) {
+      } else if (type.toUpperCase() === 'LIMIT') {
+        if (!priceRaw || parseFloat(priceRaw) <= 0) {
+          throw new Error(`Invalid limit price (${priceRaw}) for ${symbol}`);
+        }
         const price = this.exchange.priceToPrecision(symbol, priceRaw);
         order = await this.exchange.createOrder(symbol, 'limit', side, quantity, price, params);
       }
@@ -88,9 +103,13 @@ class BinanceService {
   async fetchOpenPositions(symbol) {
     try {
       const positions = await this.exchange.fetchPositions([symbol]);
-      return positions.filter(p => p.contracts > 0); // Only return active positions
+      return positions.filter(p => Math.abs(parseFloat(p.contracts || 0)) > 0); // Handles positive or negative contracts safely
     } catch (err) {
-      console.error(`❌ Failed to fetch open positions for ${symbol}:`, err.message);
+      const now = Date.now();
+      if (!this._lastFetchPosError || now - this._lastFetchPosError > 60000) {
+        console.error(`❌ Failed to fetch open positions for ${symbol}:`, err.message);
+        this._lastFetchPosError = now;
+      }
       throw err;
     }
   }
@@ -99,7 +118,11 @@ class BinanceService {
     try {
       return await this.exchange.fetchOpenOrders(symbol);
     } catch (err) {
-      console.error(`❌ Failed to fetch open orders for ${symbol}:`, err.message);
+      const now = Date.now();
+      if (!this._lastFetchOrdersError || now - this._lastFetchOrdersError > 60000) {
+        console.error(`❌ Failed to fetch open orders for ${symbol}:`, err.message);
+        this._lastFetchOrdersError = now;
+      }
       throw err;
     }
   }
@@ -118,12 +141,22 @@ class BinanceService {
     try {
       // positionSide must be 'LONG' or 'SHORT'
       const openOrders = await this.exchange.fetchOpenOrders(symbol);
-      for (const order of openOrders) {
-        if (order.info && order.info.positionSide === positionSide) {
-          await this.exchange.cancelOrder(order.id, symbol);
-          console.log(`✅ Cleaned up old ${positionSide} limit order (${order.id})`);
-        }
-      }
+      const matchingOrders = openOrders.filter(o => o.info && o.info.positionSide === positionSide);
+      if (matchingOrders.length === 0) return;
+
+      await Promise.allSettled(
+        matchingOrders.map(async (order) => {
+          try {
+            await this.exchange.cancelOrder(order.id, symbol);
+            console.log(`✅ Cleaned up old ${positionSide} limit order (${order.id})`);
+          } catch (cancelErr) {
+            // Ignore -2011 (Unknown order / already filled)
+            if (!cancelErr.message.includes('-2011')) {
+              console.warn(`⚠️ Warning cancelling ${positionSide} order (${order.id}):`, cancelErr.message);
+            }
+          }
+        })
+      );
     } catch (err) {
       console.error(`❌ Failed to cleanup orders for ${positionSide}:`, err.message);
     }
@@ -137,8 +170,8 @@ class BinanceService {
       });
       console.log(`✅ Margin mode strictly set to CROSSED for ${symbol}`);
     } catch (err) {
-      // Binance throws -4046 if it's already set to CROSSED
-      if (!err.message.includes('-4046')) {
+      // Binance throws -4046 if it's already set to CROSSED, or -4059 if positions are open
+      if (!err.message.includes('-4046') && !err.message.includes('-4059')) {
         console.error(`❌ Failed to set CROSSED margin:`, err.message);
         throw err;
       }

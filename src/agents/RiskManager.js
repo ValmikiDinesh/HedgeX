@@ -8,17 +8,26 @@ class RiskManager {
     try {
       // Fetch margin info from the standard balance endpoint
       const balanceObj = await binanceService.exchange.fetchBalance();
-      const marginInfo = balanceObj.info;
+      const marginInfo = balanceObj?.info || {};
       
-      const totalMarginBalance = parseFloat(marginInfo.totalMarginBalance);
-      const totalMaintMargin = parseFloat(marginInfo.totalMaintMargin);
+      const totalMarginBalance = parseFloat(marginInfo.totalMarginBalance || 0);
+      const totalMaintMargin = parseFloat(marginInfo.totalMaintMargin || 0);
       
       if (isNaN(totalMarginBalance) || isNaN(totalMaintMargin)) {
-        console.warn('⚠️ Could not determine margin balance. Safely pausing trading.');
-        return false; // Safely abort if API fails to return margin info
+        console.warn('⚠️ Could not determine margin balance. Safely pausing trading with PANIC status.');
+        return 'PANIC'; // Safely abort if API fails to return margin info
       }
       
-      const marginRatio = totalMarginBalance > 0 ? (totalMaintMargin / totalMarginBalance) * 100 : 0;
+      let marginRatio = 0;
+      if (totalMarginBalance > 0) {
+        marginRatio = (totalMaintMargin / totalMarginBalance) * 100;
+      } else if (totalMaintMargin > 0) {
+        // Account has zero/negative equity while maintenance margin is required! In extreme danger.
+        marginRatio = 100.0;
+      } else {
+        // Zero balance and zero margin
+        marginRatio = 0;
+      }
       
       console.log(`🛡️ Risk Manager: Current Margin Ratio is ${marginRatio.toFixed(2)}%`);
       
@@ -87,7 +96,7 @@ class RiskManager {
           symbol, 
           sideToClose, 
           positionSide, 
-          Math.abs(pos.contracts), 
+          Math.abs(parseFloat(pos.contracts || 0)), 
           'MARKET'
         );
         
@@ -99,9 +108,9 @@ class RiskManager {
         const fees = qty * entryPrice * 0.001; 
         const netPnl = unRealizedPnl - fees;
         
-        // Fetch current price for exit price estimation
-        const ticker = await binanceService.exchange.fetchTicker(symbol);
-        const currentPrice = ticker.last || entryPrice;
+        // Fetch current price for exit price estimation (with safe fallback)
+        const ticker = await binanceService.exchange.fetchTicker(symbol).catch(() => ({ last: entryPrice }));
+        const currentPrice = ticker?.last || entryPrice;
 
         const historyRecord = new TradeHistory({
           symbol: symbol,
