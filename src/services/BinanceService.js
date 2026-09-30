@@ -195,9 +195,8 @@ class BinanceService {
       if (!Array.isArray(positions)) return [];
 
       return positions.filter(p => {
-        const matchesSymbol = p.symbol === unifiedSymbol || 
-                              p.symbol === rawSymbol || 
-                              p.info?.symbol === rawSymbol;
+        const pRaw = this.toRawSymbol(p.symbol || p.info?.symbol || p.id);
+        const matchesSymbol = pRaw === rawSymbol || p.symbol === unifiedSymbol;
         const contracts = Math.abs(parseFloat(p.contracts ?? p.info?.positionAmt ?? 0));
         return matchesSymbol && contracts > 0;
       });
@@ -216,8 +215,18 @@ class BinanceService {
       await this.ensureMarketsLoaded();
       const unifiedSymbol = this.toUnifiedSymbol(symbol);
       const rawSymbol = this.toRawSymbol(symbol);
-      const targetSymbol = this.exchange.markets[unifiedSymbol] ? unifiedSymbol : rawSymbol;
-      return await this.exchange.fetchOpenOrders(targetSymbol);
+      const targetSymbol = this.exchange.markets[unifiedSymbol] ? unifiedSymbol : (this.exchange.markets[rawSymbol] ? rawSymbol : symbol);
+      let orders = [];
+      try {
+        orders = await this.exchange.fetchOpenOrders(targetSymbol);
+      } catch (orderErr) {
+        if (targetSymbol !== unifiedSymbol) {
+          orders = await this.exchange.fetchOpenOrders(unifiedSymbol);
+        } else {
+          throw orderErr;
+        }
+      }
+      return Array.isArray(orders) ? orders : [];
     } catch (err) {
       const now = Date.now();
       if (!this._lastFetchOrdersError || now - this._lastFetchOrdersError > 60000) {
@@ -233,9 +242,19 @@ class BinanceService {
       await this.ensureMarketsLoaded();
       const unifiedSymbol = this.toUnifiedSymbol(symbol);
       const rawSymbol = this.toRawSymbol(symbol);
-      const targetSymbol = this.exchange.markets[unifiedSymbol] ? unifiedSymbol : rawSymbol;
-      await this.exchange.cancelAllOrders(targetSymbol);
-      console.log(`✅ Cancelled all open limit orders for ${symbol}`);
+      const targetSymbol = this.exchange.markets[unifiedSymbol] ? unifiedSymbol : (this.exchange.markets[rawSymbol] ? rawSymbol : symbol);
+      try {
+        await this.exchange.cancelAllOrders(targetSymbol);
+        console.log(`✅ Cancelled all open limit orders for ${symbol}`);
+      } catch (err) {
+        if (err.message && err.message.includes('-2011')) return;
+        // Fallback: fetch open orders and cancel individually
+        const openOrders = await this.fetchOpenOrders(symbol);
+        if (openOrders.length > 0) {
+          await Promise.allSettled(openOrders.map(o => this.exchange.cancelOrder(o.id, o.symbol || targetSymbol)));
+          console.log(`✅ Cancelled ${openOrders.length} orders individually for ${symbol}`);
+        }
+      }
     } catch (err) {
       // Ignore if no open orders to cancel (-2011)
       if (err.message && err.message.includes('-2011')) {
@@ -259,7 +278,7 @@ class BinanceService {
       await Promise.allSettled(
         matchingOrders.map(async (order) => {
           try {
-            await this.exchange.cancelOrder(order.id, targetSymbol);
+            await this.exchange.cancelOrder(order.id, order.symbol || targetSymbol);
             console.log(`✅ Cleaned up old ${positionSide} limit order (${order.id})`);
           } catch (cancelErr) {
             if (!cancelErr.message || !cancelErr.message.includes('-2011')) {

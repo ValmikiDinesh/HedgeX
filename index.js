@@ -106,8 +106,16 @@ app.get('/api/grid', async (req, res) => {
       console.error('Failed to get live price:', priceErr.message);
     }
 
-    const longPos = positions.find(p => (p.info?.positionSide === 'LONG') || (p.side === 'long'));
-    const shortPos = positions.find(p => (p.info?.positionSide === 'SHORT') || (p.side === 'short'));
+    const longPos = positions.find(p => 
+      (p.info?.positionSide === 'LONG') || 
+      (p.side === 'long') || 
+      (p.info?.positionSide === 'BOTH' && parseFloat(p.info?.positionAmt || 0) > 0)
+    );
+    const shortPos = positions.find(p => 
+      (p.info?.positionSide === 'SHORT') || 
+      (p.side === 'short') || 
+      (p.info?.positionSide === 'BOTH' && parseFloat(p.info?.positionAmt || 0) < 0)
+    );
     const activeGrid = activeGrids.find(g => binanceService.toRawSymbol(g.symbol) === rawSymbol);
 
     const calculateBreakdown = (pos, currentPrice, legDb) => {

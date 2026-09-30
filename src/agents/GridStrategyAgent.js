@@ -135,8 +135,16 @@ class GridStrategyAgent {
         return;
       }
 
-      let longPos = positions.find(p => (p.info?.positionSide === 'LONG') || (p.side === 'long'));
-      let shortPos = positions.find(p => (p.info?.positionSide === 'SHORT') || (p.side === 'short'));
+      let longPos = positions.find(p => 
+        (p.info?.positionSide === 'LONG') || 
+        (p.side === 'long') || 
+        (p.info?.positionSide === 'BOTH' && parseFloat(p.info?.positionAmt || 0) > 0)
+      );
+      let shortPos = positions.find(p => 
+        (p.info?.positionSide === 'SHORT') || 
+        (p.side === 'short') || 
+        (p.info?.positionSide === 'BOTH' && parseFloat(p.info?.positionAmt || 0) < 0)
+      );
       
       const currentPrice = await marketAgent.getCurrentPrice(symbol);
       if (!currentPrice || currentPrice <= 0) {
@@ -158,16 +166,26 @@ class GridStrategyAgent {
         }
       }
 
-      // 5. Fetch or Create DB Record (ensure single active record per symbol)
-      let activeRecords = await HedgePosition.find({ symbol: symbol, status: 'active' }).sort({ createdAt: -1 });
+      // 5. Fetch or Create DB Record (ensure single active record per symbol across formats)
+      const unifiedSymbol = binanceService.toUnifiedSymbol(symbol);
+      let activeRecords = await HedgePosition.find({ 
+        symbol: { $in: [symbol, rawSymbol, unifiedSymbol] }, 
+        status: 'active' 
+      }).sort({ createdAt: -1 });
+
       let dbRecord = activeRecords[0];
       if (!dbRecord) {
         dbRecord = new HedgePosition({ symbol: symbol });
         await dbRecord.save();
-      } else if (activeRecords.length > 1) {
-        // Close redundant zombie active records
-        const extraIds = activeRecords.slice(1).map(r => r._id);
-        await HedgePosition.updateMany({ _id: { $in: extraIds } }, { $set: { status: 'closed' } });
+      } else {
+        if (dbRecord.symbol !== symbol) {
+          dbRecord.symbol = symbol;
+        }
+        if (activeRecords.length > 1) {
+          // Close redundant zombie active records
+          const extraIds = activeRecords.slice(1).map(r => r._id);
+          await HedgePosition.updateMany({ _id: { $in: extraIds } }, { $set: { status: 'closed' } });
+        }
       }
       if (!dbRecord.longLeg) dbRecord.longLeg = {};
       if (!dbRecord.shortLeg) dbRecord.shortLeg = {};
@@ -247,10 +265,15 @@ class GridStrategyAgent {
               exit = nominalExit;
             }
           }
+          if (!exit || isNaN(exit) || exit <= 0) {
+            exit = nominalExit || entry;
+          }
           
-          let grossPnl = (side === 'LONG') ? (exit - entry) * qty : (entry - exit) * qty;
+          let rawGross = (side === 'LONG') ? (exit - entry) * qty : (entry - exit) * qty;
+          const grossPnl = isFinite(rawGross) ? rawGross : 0;
           const exitFeeRate = (nominalExit && Math.abs(exit - nominalExit) < 0.0001) ? 0.0002 : 0.0005;
-          const fees = (entry * qty * 0.0005) + (exit * qty * exitFeeRate);
+          const rawFees = (entry * qty * 0.0005) + (exit * qty * exitFeeRate);
+          const fees = isFinite(rawFees) ? rawFees : 0;
           const netPnl = grossPnl - fees;
           
           console.log(`💰 ${side} Trade Closed! Realized Net PnL: $${netPnl.toFixed(4)} (Entry: $${entry}, Exit: $${exit.toFixed(5)})`);
@@ -268,7 +291,8 @@ class GridStrategyAgent {
           await historyRecord.save();
           
           oldLeg.status = 'closed';
-          dbRecord.totalRealizedPnl = (dbRecord.totalRealizedPnl || 0) + netPnl;
+          const currentTotal = isFinite(dbRecord.totalRealizedPnl) ? dbRecord.totalRealizedPnl : 0;
+          dbRecord.totalRealizedPnl = currentTotal + (isFinite(netPnl) ? netPnl : 0);
           await dbRecord.save();
         } catch (err) {
           console.error(`❌ Failed to log closed trade:`, err.message);
