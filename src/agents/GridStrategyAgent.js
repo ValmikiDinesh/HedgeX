@@ -458,6 +458,7 @@ class GridStrategyAgent {
            const tpPriceRaw = Math.max(entryPrice * (1 + effectiveGridPercent), currentPrice * 1.0005);
            const qty = Math.abs(parseFloat(longPos.contracts ?? longPos.info?.positionAmt ?? 0));
            try {
+             await binanceService.cancelOrdersBySide(symbol, 'LONG');
              await binanceService.placeHedgeOrder(symbol, 'SELL', 'LONG', qty, 'LIMIT', tpPriceRaw);
              console.log(`✅ LONG Take-Profit set on reload fill at $${tpPriceRaw.toFixed(5)}`);
            } catch (tpErr) {
@@ -683,6 +684,7 @@ class GridStrategyAgent {
            const tpPriceRaw = Math.min(entryPrice * (1 - effectiveGridPercent), currentPrice * 0.9995);
            const qty = Math.abs(parseFloat(shortPos.contracts ?? shortPos.info?.positionAmt ?? 0));
            try {
+             await binanceService.cancelOrdersBySide(symbol, 'SHORT');
              await binanceService.placeHedgeOrder(symbol, 'BUY', 'SHORT', qty, 'LIMIT', tpPriceRaw);
              console.log(`✅ SHORT Take-Profit set on reload fill at $${tpPriceRaw.toFixed(5)}`);
            } catch (tpErr) {

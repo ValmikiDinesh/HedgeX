@@ -126,6 +126,7 @@ app.get('/api/grid', async (req, res) => {
       return {
         contracts: qty,
         entryPrice: entryPrice,
+        takeProfitPrice: legDb?.takeProfitPrice || null,
         dcaCount: legDb?.dcaCount || 0,
         lastDcaPrice: legDb?.lastDcaPrice || null,
         grossPnl: isFinite(grossPnl) ? grossPnl.toFixed(4) : "0.0000",
@@ -347,15 +348,18 @@ async function startBot() {
   });
 
   // Emit current price immediately whenever a client connects
-  io.on('connection', (socket) => {
-    if (marketAgent.livePrice) {
-      const rawSymbol = binanceService.toRawSymbol(marketAgent.currentSymbol);
-      socket.emit('price_update', {
-        symbol: rawSymbol,
-        unifiedSymbol: marketAgent.currentSymbol,
-        price: marketAgent.livePrice
-      });
-    }
+  io.on('connection', async (socket) => {
+    try {
+      const price = marketAgent.livePrice || await marketAgent.getCurrentPrice(marketAgent.currentSymbol);
+      if (price) {
+        const rawSymbol = binanceService.toRawSymbol(marketAgent.currentSymbol);
+        socket.emit('price_update', {
+          symbol: rawSymbol,
+          unifiedSymbol: marketAgent.currentSymbol,
+          price
+        });
+      }
+    } catch (_) {}
   });
 
   // Load settings to start watching symbol immediately

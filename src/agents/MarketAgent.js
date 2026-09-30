@@ -28,12 +28,12 @@ class MarketAgent extends EventEmitter {
     // Fetch initial price immediately so UI doesn't wait
     this.getCurrentPrice(targetSymbol).catch(() => {});
     
-    // Setup fallback heartbeat (if WebSocket quiet for > 20s, poll REST)
+    // Setup fallback heartbeat (if WebSocket quiet for > 12s, poll REST)
     if (!this._heartbeatInterval) {
       this._heartbeatInterval = setInterval(async () => {
         if (this.isWatching && this.currentSymbol) {
           const now = Date.now();
-          if (now - this.lastPriceTimestamp > 20000) {
+          if (now - this.lastPriceTimestamp > 12000) {
             try {
               const freshPrice = await this.getCurrentPrice(this.currentSymbol);
               if (freshPrice && freshPrice > 0) {

@@ -52,6 +52,15 @@ const GridLegCard = ({ side, position, symbol, maxDcaLayers = 3 }) => {
               <span className="data-value">{formatPrice(position.entryPrice)}</span>
             </div>
 
+            {position.takeProfitPrice && (
+              <div className="data-row">
+                <span className="data-label">Take Profit Target</span>
+                <span className="data-value" style={{ color: 'var(--profit-green)', fontWeight: '600' }}>
+                  {formatPrice(position.takeProfitPrice)}
+                </span>
+              </div>
+            )}
+
             {position.lastDcaPrice && (
               <div className="data-row">
                 <span className="data-label">Last DCA Price</span>

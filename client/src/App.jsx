@@ -58,6 +58,12 @@ function App() {
     maxGridPercentage: 3.5
   });
   const [saving, setSaving] = useState(false);
+  const currentSymbolRef = useRef(settings.symbol);
+  const flashTimerRef = useRef(null);
+
+  useEffect(() => {
+    currentSymbolRef.current = settings.symbol;
+  }, [settings.symbol]);
 
   // Helper to normalize crypto symbols for safe comparison
   const normalizeSymbol = (s) => (s || '').replace(/[/:]/g, '').replace(/USDTUSDT$/i, 'USDT').toUpperCase();
@@ -110,7 +116,7 @@ function App() {
     return () => clearInterval(interval);
   }, [showSettings]);
 
-  // Real-time WebSocket Price Stream
+  // Real-time WebSocket Price Stream (Persistent connection)
   useEffect(() => {
     const socket = io();
     
@@ -120,20 +126,24 @@ function App() {
     socket.on('price_update', (data) => {
       if (typeof data === 'object' && data !== null) {
         const updateSym = normalizeSymbol(data.symbol || data.unifiedSymbol);
-        const currentSym = normalizeSymbol(settings.symbol);
+        const currentSym = normalizeSymbol(currentSymbolRef.current);
         
         if (!updateSym || updateSym === currentSym) {
           setGridData(prev => ({ ...prev, livePrice: data.price }));
           setPriceFlash(true);
-          setTimeout(() => setPriceFlash(false), 300);
+          if (flashTimerRef.current) clearTimeout(flashTimerRef.current);
+          flashTimerRef.current = setTimeout(() => setPriceFlash(false), 300);
         }
       } else if (typeof data === 'number') {
         setGridData(prev => ({ ...prev, livePrice: data }));
       }
     });
 
-    return () => socket.disconnect();
-  }, [settings.symbol]);
+    return () => {
+      if (flashTimerRef.current) clearTimeout(flashTimerRef.current);
+      socket.disconnect();
+    };
+  }, []);
 
   // Handle ESC key to dismiss modal
   useEffect(() => {
@@ -216,8 +226,8 @@ function App() {
 
   const isMarginSafe = (parseFloat(status.marginRatio) || 0) < 80;
 
-  const formatPrice = (p) => {
-    if (p === null || p === undefined || isNaN(p) || parseFloat(p) <= 0) return 'Loading...';
+  const formatPrice = (p, fallback = 'Loading...') => {
+    if (p === null || p === undefined || isNaN(p) || parseFloat(p) <= 0) return fallback;
     const num = parseFloat(p);
     if (num >= 1000) return `$${num.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
     if (num >= 1) return `$${num.toFixed(4)}`;
@@ -341,8 +351,8 @@ function App() {
                             {trade.side}
                           </span>
                         </td>
-                        <td>{formatPrice(trade.entryPrice)}</td>
-                        <td>{formatPrice(trade.exitPrice)}</td>
+                        <td>{formatPrice(trade.entryPrice, '$0.00')}</td>
+                        <td>{formatPrice(trade.exitPrice, '$0.00')}</td>
                         <td className={(parseFloat(trade.grossPnl) || 0) >= 0 ? 'text-green' : 'text-red'}>
                           {(parseFloat(trade.grossPnl) || 0) >= 0 ? '+' : ''}{Number(trade.grossPnl || 0).toFixed(4)} USDT
                         </td>
