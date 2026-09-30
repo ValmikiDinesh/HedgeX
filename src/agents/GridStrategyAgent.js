@@ -491,6 +491,9 @@ class GridStrategyAgent {
               dbRecord.longLeg.status = 'pending';
               dbRecord.longLeg.entryPrice = prevEntry;
               dbRecord.longLeg.quantity = quantityRaw;
+              dbRecord.longLeg.takeProfitPrice = null;
+              dbRecord.longLeg.stopLossPrice = null;
+              dbRecord.longLeg.stoppedOutAt = null;
               dbRecord.longLeg.dcaCount = 0;
               dbRecord.longLeg.lastDcaPrice = null;
               await dbRecord.save();
@@ -554,6 +557,8 @@ class GridStrategyAgent {
                });
                await historyRecord.save();
                dbRecord.longLeg.status = 'closed';
+               dbRecord.longLeg.takeProfitPrice = null;
+               dbRecord.longLeg.stopLossPrice = null;
                dbRecord.longLeg.dcaCount = 0;
                dbRecord.longLeg.lastDcaPrice = null;
                dbRecord.totalRealizedPnl = (dbRecord.totalRealizedPnl || 0) + netPnl;
@@ -612,6 +617,8 @@ class GridStrategyAgent {
             
             dbRecord.longLeg.status = 'closed';
             dbRecord.longLeg.entryPrice = null;
+            dbRecord.longLeg.takeProfitPrice = null;
+            dbRecord.longLeg.stopLossPrice = null;
             dbRecord.longLeg.dcaCount = 0;
             dbRecord.longLeg.lastDcaPrice = null;
             dbRecord.longLeg.unrealizedPnl = 0;
@@ -724,6 +731,9 @@ class GridStrategyAgent {
               dbRecord.shortLeg.status = 'pending';
               dbRecord.shortLeg.entryPrice = prevEntry;
               dbRecord.shortLeg.quantity = quantityRaw;
+              dbRecord.shortLeg.takeProfitPrice = null;
+              dbRecord.shortLeg.stopLossPrice = null;
+              dbRecord.shortLeg.stoppedOutAt = null;
               dbRecord.shortLeg.dcaCount = 0;
               dbRecord.shortLeg.lastDcaPrice = null;
               await dbRecord.save();
@@ -787,6 +797,8 @@ class GridStrategyAgent {
                });
                await historyRecord.save();
                dbRecord.shortLeg.status = 'closed';
+               dbRecord.shortLeg.takeProfitPrice = null;
+               dbRecord.shortLeg.stopLossPrice = null;
                dbRecord.shortLeg.dcaCount = 0;
                dbRecord.shortLeg.lastDcaPrice = null;
                dbRecord.totalRealizedPnl = (dbRecord.totalRealizedPnl || 0) + netPnl;
@@ -845,6 +857,8 @@ class GridStrategyAgent {
             
             dbRecord.shortLeg.status = 'closed';
             dbRecord.shortLeg.entryPrice = null;
+            dbRecord.shortLeg.takeProfitPrice = null;
+            dbRecord.shortLeg.stopLossPrice = null;
             dbRecord.shortLeg.dcaCount = 0;
             dbRecord.shortLeg.lastDcaPrice = null;
             dbRecord.shortLeg.unrealizedPnl = 0;

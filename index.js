@@ -278,8 +278,10 @@ app.post('/api/settings', async (req, res) => {
           console.error('Error closing positions during symbol swap:', e.message);
         }
         try {
+          const rawOld = binanceService.toRawSymbol(settings.symbol);
+          const unifiedOld = binanceService.toUnifiedSymbol(settings.symbol);
           await HedgePosition.updateMany(
-            { symbol: settings.symbol, status: 'active' }, 
+            { symbol: { $in: [settings.symbol, rawOld, unifiedOld] }, status: 'active' }, 
             { $set: { status: 'closed', 'longLeg.status': 'closed', 'shortLeg.status': 'closed' } }
           );
         } catch (e) {
@@ -306,7 +308,9 @@ app.get('/api/history', async (req, res) => {
   try {
     const filter = {};
     if (req.query.symbol) {
-      filter.symbol = binanceService.toRawSymbol(req.query.symbol);
+      const raw = binanceService.toRawSymbol(req.query.symbol);
+      const unified = binanceService.toUnifiedSymbol(req.query.symbol);
+      filter.symbol = { $in: [req.query.symbol, raw, unified] };
     }
     const history = await TradeHistory.find(filter).sort({ closedAt: -1 }).limit(50);
     res.json(Array.isArray(history) ? history : []);
@@ -353,12 +357,14 @@ async function startBot() {
   // Setup live price emitter
   let lastEmitTime = 0;
   marketAgent.on('price_tick', (price) => {
+    if (!price || !isFinite(price) || price <= 0) return;
     const now = Date.now();
     if (now - lastEmitTime > 150) {
-      const rawSymbol = binanceService.toRawSymbol(marketAgent.currentSymbol);
+      const curSym = marketAgent.currentSymbol || '';
+      const rawSymbol = binanceService.toRawSymbol(curSym);
       io.emit('price_update', { 
         symbol: rawSymbol,
-        unifiedSymbol: marketAgent.currentSymbol, 
+        unifiedSymbol: curSym, 
         price 
       });
       lastEmitTime = now;
