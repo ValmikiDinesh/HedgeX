@@ -23,6 +23,7 @@ class BinanceService {
     this._lastFetchOrdersError = 0;
     this._lastBalanceError = 0;
     this._lastMarginLeverageError = 0;
+    this.isOneWayMode = false;
   }
 
   toRawSymbol(symbol) {
@@ -87,13 +88,21 @@ class BinanceService {
       
       if (!isHedgeMode) {
         console.log('Switching account to Hedge Mode (Dual-Side Position)...');
-        await this.exchange.fapiPrivatePostPositionSideDual({ dualSidePosition: 'true' });
-        console.log('✅ Successfully enabled Hedge Mode.');
+        try {
+          await this.exchange.fapiPrivatePostPositionSideDual({ dualSidePosition: 'true' });
+          this.isOneWayMode = false;
+          console.log('✅ Successfully enabled Hedge Mode.');
+        } catch (switchErr) {
+          console.warn('⚠️ Could not switch account to Hedge Mode (open positions exist or permissions restricted). Operating in One-Way Mode.');
+          this.isOneWayMode = true;
+        }
       } else {
+        this.isOneWayMode = false;
         console.log('✅ Account is already in Hedge Mode.');
       }
     } catch (err) {
       if (err.message && (err.message.includes('-4059') || err.message.includes('No need to change'))) {
+        this.isOneWayMode = false;
         console.log('✅ Account is already in Hedge Mode.');
       } else {
         console.error('❌ Error configuring Hedge Mode:', err.message);
@@ -103,8 +112,13 @@ class BinanceService {
   }
 
   async placeHedgeOrder(symbol, side, positionSide, quantityRaw, type = 'MARKET', priceRaw = null) {
+    let targetPositionSide = positionSide;
+    if (this.isOneWayMode && (positionSide === 'LONG' || positionSide === 'SHORT')) {
+      targetPositionSide = 'BOTH';
+    }
+    const params = { positionSide: targetPositionSide };
+
     try {
-      const params = { positionSide }; // 'LONG' or 'SHORT'
       await this.ensureMarketsLoaded();
 
       const unifiedSymbol = this.toUnifiedSymbol(symbol);
@@ -152,6 +166,27 @@ class BinanceService {
       }
       return order;
     } catch (err) {
+      if (err.message && err.message.includes('-4061')) {
+        console.warn(`⚠️ Position side mismatch (-4061). Auto-adapting mode and retrying...`);
+        const fallbackSide = (targetPositionSide === 'BOTH') ? (side.toUpperCase() === 'BUY' ? 'LONG' : 'SHORT') : 'BOTH';
+        this.isOneWayMode = (fallbackSide === 'BOTH');
+        const retryParams = { positionSide: fallbackSide };
+        try {
+          const unifiedSymbol = this.toUnifiedSymbol(symbol);
+          const rawSymbol = this.toRawSymbol(symbol);
+          const targetSymbol = this.exchange.markets[unifiedSymbol] ? unifiedSymbol : (this.exchange.markets[rawSymbol] ? rawSymbol : symbol);
+          let quantity = this.exchange.amountToPrecision(targetSymbol, quantityRaw);
+          if (type.toUpperCase() === 'MARKET') {
+            return await this.exchange.createOrder(targetSymbol, 'market', side.toLowerCase(), quantity, undefined, retryParams);
+          } else if (type.toUpperCase() === 'LIMIT') {
+            const price = this.exchange.priceToPrecision(targetSymbol, priceRaw);
+            return await this.exchange.createOrder(targetSymbol, 'limit', side.toLowerCase(), quantity, price, retryParams);
+          }
+        } catch (retryErr) {
+          console.error(`❌ Retry after -4061 adaptation also failed:`, retryErr.message);
+          throw retryErr;
+        }
+      }
       console.error(`❌ Failed to place ${positionSide} ${side} order on ${symbol}:`, err.message);
       throw err;
     }

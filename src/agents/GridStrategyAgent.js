@@ -301,8 +301,8 @@ class GridStrategyAgent {
 
       // 9. Self-Healing State Machine (Detect & Repair Orphaned Positions without TP)
       const openOrders = await binanceService.fetchOpenOrders(symbol);
-      const longTpOrders = openOrders.filter(o => o.info && o.info.positionSide === 'LONG' && o.info.side === 'SELL' && (o.type && o.type.toLowerCase() === 'limit'));
-      const shortTpOrders = openOrders.filter(o => o.info && o.info.positionSide === 'SHORT' && o.info.side === 'BUY' && (o.type && o.type.toLowerCase() === 'limit'));
+      const longTpOrders = openOrders.filter(o => o.info && (o.info.positionSide === 'LONG' || o.info.positionSide === 'BOTH') && o.info.side === 'SELL' && (o.type && o.type.toLowerCase() === 'limit'));
+      const shortTpOrders = openOrders.filter(o => o.info && (o.info.positionSide === 'SHORT' || o.info.positionSide === 'BOTH') && o.info.side === 'BUY' && (o.type && o.type.toLowerCase() === 'limit'));
 
       // LONG Self-Healing
       if (longPos && Math.abs(parseFloat(longPos.contracts ?? longPos.info?.positionAmt ?? 0)) > 0 && longTpOrders.length === 0) {
@@ -452,6 +452,8 @@ class GridStrategyAgent {
         if (dbRecord.longLeg && dbRecord.longLeg.status === 'open') {
           await logClosedTrade('LONG', dbRecord.longLeg);
           dbRecord.longLeg.status = 'closed';
+          dbRecord.longLeg.takeProfitPrice = null;
+          dbRecord.longLeg.stopLossPrice = null;
           dbRecord.longLeg.dcaCount = 0;
           dbRecord.longLeg.lastDcaPrice = null;
           await binanceService.cancelOrdersBySide(symbol, 'LONG').catch(() => {});
@@ -467,7 +469,7 @@ class GridStrategyAgent {
         if (longCooldownRemaining > 0) {
           console.log(`⏳ LONG leg is in Stop-Loss Cooldown (${Math.ceil(longCooldownRemaining / 1000)}s left). Holding off re-entry.`);
         } else if (tradingEnabled && canOpenNewPosition) {
-          const existingLongBuy = openOrders.find(o => o.info && o.info.positionSide === 'LONG' && o.info.side === 'BUY' && (o.type && o.type.toLowerCase() === 'limit'));
+          const existingLongBuy = openOrders.find(o => o.info && (o.info.positionSide === 'LONG' || o.info.positionSide === 'BOTH') && o.info.side === 'BUY' && (o.type && o.type.toLowerCase() === 'limit'));
           const prevEntry = dbRecord.longLeg?.entryPrice;
 
           if (existingLongBuy) {
@@ -632,7 +634,7 @@ class GridStrategyAgent {
             console.log(`📉 Price dropped below grid! DCA LONG leg (Layer ${currentLongDca + 1}/${maxDcaLayers})...`);
             try {
               const verifyPositions = await binanceService.fetchOpenPositions(symbol);
-              const verifyLong = verifyPositions.find(p => (p.info?.positionSide === 'LONG') || (p.side === 'long'));
+              const verifyLong = verifyPositions.find(p => (p.info?.positionSide === 'LONG') || (p.side === 'long') || (p.info?.positionSide === 'BOTH' && parseFloat(p.info?.positionAmt || 0) > 0));
               if (verifyLong && Math.abs(parseFloat(verifyLong.contracts ?? verifyLong.info?.positionAmt ?? 0)) > 0) {
                 const freeMargin = await binanceService.getBalance();
                 const safeLeverage = (leverage && leverage > 0) ? leverage : 1;
@@ -650,7 +652,7 @@ class GridStrategyAgent {
                   try {
                     await binanceService.cancelOrdersBySide(symbol, 'LONG');
                     const updatedPositions = await binanceService.fetchOpenPositions(symbol);
-                    const updatedLong = updatedPositions.find(p => (p.info?.positionSide === 'LONG') || (p.side === 'long'));
+                    const updatedLong = updatedPositions.find(p => (p.info?.positionSide === 'LONG') || (p.side === 'long') || (p.info?.positionSide === 'BOTH' && parseFloat(p.info?.positionAmt || 0) > 0));
                     if (updatedLong && Math.abs(parseFloat(updatedLong.contracts ?? updatedLong.info?.positionAmt ?? 0)) > 0) {
                       const newEntry = parseFloat(updatedLong.info?.entryPrice || updatedLong.entryPrice || 0);
                       const newQty = Math.abs(parseFloat(updatedLong.contracts ?? updatedLong.info?.positionAmt ?? 0));
@@ -683,6 +685,8 @@ class GridStrategyAgent {
         if (dbRecord.shortLeg && dbRecord.shortLeg.status === 'open') {
           await logClosedTrade('SHORT', dbRecord.shortLeg);
           dbRecord.shortLeg.status = 'closed';
+          dbRecord.shortLeg.takeProfitPrice = null;
+          dbRecord.shortLeg.stopLossPrice = null;
           dbRecord.shortLeg.dcaCount = 0;
           dbRecord.shortLeg.lastDcaPrice = null;
           await binanceService.cancelOrdersBySide(symbol, 'SHORT').catch(() => {});
@@ -698,7 +702,7 @@ class GridStrategyAgent {
         if (shortCooldownRemaining > 0) {
           console.log(`⏳ SHORT leg is in Stop-Loss Cooldown (${Math.ceil(shortCooldownRemaining / 1000)}s left). Holding off re-entry.`);
         } else if (tradingEnabled && canOpenNewPosition) {
-          const existingShortSell = openOrders.find(o => o.info && o.info.positionSide === 'SHORT' && o.info.side === 'SELL' && (o.type && o.type.toLowerCase() === 'limit'));
+          const existingShortSell = openOrders.find(o => o.info && (o.info.positionSide === 'SHORT' || o.info.positionSide === 'BOTH') && o.info.side === 'SELL' && (o.type && o.type.toLowerCase() === 'limit'));
           const prevEntry = dbRecord.shortLeg?.entryPrice;
 
           if (existingShortSell) {
@@ -863,7 +867,7 @@ class GridStrategyAgent {
             console.log(`📈 Price pumped above grid! DCA SHORT leg (Layer ${currentShortDca + 1}/${maxDcaLayers})...`);
             try {
               const verifyPositions = await binanceService.fetchOpenPositions(symbol);
-              const verifyShort = verifyPositions.find(p => (p.info?.positionSide === 'SHORT') || (p.side === 'short'));
+              const verifyShort = verifyPositions.find(p => (p.info?.positionSide === 'SHORT') || (p.side === 'short') || (p.info?.positionSide === 'BOTH' && parseFloat(p.info?.positionAmt || 0) < 0));
               if (verifyShort && Math.abs(parseFloat(verifyShort.contracts ?? verifyShort.info?.positionAmt ?? 0)) > 0) {
                 const freeMargin = await binanceService.getBalance();
                 const safeLeverage = (leverage && leverage > 0) ? leverage : 1;
@@ -881,7 +885,7 @@ class GridStrategyAgent {
                   try {
                     await binanceService.cancelOrdersBySide(symbol, 'SHORT');
                     const updatedPositions = await binanceService.fetchOpenPositions(symbol);
-                    const updatedShort = updatedPositions.find(p => (p.info?.positionSide === 'SHORT') || (p.side === 'short'));
+                    const updatedShort = updatedPositions.find(p => (p.info?.positionSide === 'SHORT') || (p.side === 'short') || (p.info?.positionSide === 'BOTH' && parseFloat(p.info?.positionAmt || 0) < 0));
                     if (updatedShort && Math.abs(parseFloat(updatedShort.contracts ?? updatedShort.info?.positionAmt ?? 0)) > 0) {
                       const newEntry = parseFloat(updatedShort.info?.entryPrice || updatedShort.entryPrice || 0);
                       const newQty = Math.abs(parseFloat(updatedShort.contracts ?? updatedShort.info?.positionAmt ?? 0));
