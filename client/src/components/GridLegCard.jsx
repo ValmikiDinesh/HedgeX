@@ -1,5 +1,5 @@
 import React from 'react';
-import { TrendingUp, TrendingDown, Clock } from 'lucide-react';
+import { TrendingUp, TrendingDown, Clock, Layers, DollarSign } from 'lucide-react';
 
 const GridLegCard = ({ side, position, symbol, maxDcaLayers = 3 }) => {
   const isLong = side === 'LONG';
@@ -13,9 +13,9 @@ const GridLegCard = ({ side, position, symbol, maxDcaLayers = 3 }) => {
   const fees = isActive ? Math.abs(parseFloat(position.fees) || 0) : 0;
 
   const formatPrice = (p) => {
-    if (!p || isNaN(p)) return '0.00';
+    if (!p || isNaN(p) || parseFloat(p) <= 0) return '0.00';
     const num = parseFloat(p);
-    if (num >= 100) return `$${num.toFixed(2)}`;
+    if (num >= 1000) return `$${num.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
     if (num >= 1) return `$${num.toFixed(4)}`;
     return `$${num.toFixed(5)}`;
   };
@@ -24,12 +24,12 @@ const GridLegCard = ({ side, position, symbol, maxDcaLayers = 3 }) => {
     <div className={`leg-card ${isLong ? 'long' : 'short'}`}>
       <div className="card-header">
         <div className="card-title">
-          <Icon size={24} color={isLong ? 'var(--profit-green)' : 'var(--loss-red)'} />
-          {side} LEG
+          <Icon size={22} color={isLong ? 'var(--profit-green)' : 'var(--loss-red)'} />
+          <span>{side} LEG</span>
         </div>
         <div style={{ display: 'flex', gap: '8px', alignItems: 'center' }}>
           {isActive && (
-            <span className={`badge ${dcaCount > 0 ? 'warning' : 'safe'}`} style={{ fontSize: '0.75rem' }}>
+            <span className={`badge ${dcaCount > 0 ? 'warning' : 'safe'}`}>
               DCA: {dcaCount}/{maxDcaLayers}
             </span>
           )}
@@ -41,7 +41,7 @@ const GridLegCard = ({ side, position, symbol, maxDcaLayers = 3 }) => {
 
       <div className="card-body">
         <div className="data-row">
-          <span className="data-label">Asset</span>
+          <span className="data-label">Asset Pair</span>
           <span className="data-value">{symbol}</span>
         </div>
         
@@ -60,37 +60,43 @@ const GridLegCard = ({ side, position, symbol, maxDcaLayers = 3 }) => {
             )}
 
             <div className="data-row">
-              <span className="data-label">Size (Contracts)</span>
-              <span className="data-value">{Math.abs(parseFloat(position.contracts || 0))}</span>
+              <span className="data-label">Position Size</span>
+              <span className="data-value">{Math.abs(parseFloat(position.contracts || 0))} Contracts</span>
             </div>
             
-            <div className="pnl-breakdown" style={{ marginTop: '1rem', padding: '1rem', background: 'rgba(0,0,0,0.2)', borderRadius: '8px' }}>
-              <div className="data-row" style={{ marginBottom: '8px' }}>
-                <span className="data-label">Gross PnL</span>
+            <div style={{ 
+              marginTop: '1.25rem', 
+              padding: '1rem', 
+              background: 'rgba(15, 20, 31, 0.75)', 
+              borderRadius: '12px',
+              border: '1px solid var(--border-color)'
+            }}>
+              <div className="data-row" style={{ padding: '0.35rem 0' }}>
+                <span className="data-label">Gross Unrealized PnL</span>
                 <span className="data-value" style={{ color: grossPnl >= 0 ? 'var(--profit-green)' : 'var(--loss-red)' }}>
                   {grossPnl >= 0 ? '+' : ''}{grossPnl.toFixed(4)} USDT
                 </span>
               </div>
               
-              <div className="data-row" style={{ marginBottom: '8px' }}>
-                <span className="data-label">Est. Fees</span>
+              <div className="data-row" style={{ padding: '0.35rem 0' }}>
+                <span className="data-label">Estimated Round-trip Fees</span>
                 <span className="data-value" style={{ color: 'var(--loss-red)' }}>
                   -{fees.toFixed(4)} USDT
                 </span>
               </div>
               
-              <div className="data-row" style={{ marginTop: '12px', paddingTop: '12px', borderTop: '1px solid rgba(255,255,255,0.1)' }}>
-                <span className="data-label" style={{ fontWeight: 'bold' }}>Net PnL</span>
-                <span className="data-value" style={{ fontWeight: 'bold', fontSize: '1.2rem', color: isProfit ? 'var(--profit-green)' : 'var(--loss-red)' }}>
+              <div className="data-row" style={{ marginTop: '0.5rem', paddingTop: '0.75rem', borderTop: '1px solid var(--border-color)' }}>
+                <span className="data-label" style={{ fontWeight: '700', color: 'var(--text-primary)' }}>Net PnL</span>
+                <span className="data-value" style={{ fontWeight: '800', fontSize: '1.15rem', color: isProfit ? 'var(--profit-green)' : 'var(--loss-red)' }}>
                   {isProfit ? '+' : ''}{pnl.toFixed(4)} USDT
                 </span>
               </div>
             </div>
           </>
         ) : (
-          <div className="empty-state" style={{ padding: '2rem 1rem', marginTop: '1rem' }}>
+          <div className="empty-state" style={{ padding: '2.5rem 1rem', marginTop: '1rem' }}>
             <Clock className="empty-icon" size={32} style={{ margin: '0 auto' }} />
-            <p style={{ marginTop: '0.5rem', fontSize: '0.875rem' }}>Waiting for Grid Replenishment...</p>
+            <p style={{ marginTop: '0.5rem', fontSize: '0.85rem' }}>Waiting for Market Entry Trigger...</p>
           </div>
         )}
       </div>
@@ -99,4 +105,3 @@ const GridLegCard = ({ side, position, symbol, maxDcaLayers = 3 }) => {
 };
 
 export default GridLegCard;
-

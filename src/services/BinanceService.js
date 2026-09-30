@@ -18,20 +18,35 @@ class BinanceService {
     };
     this.exchange = new ccxt.binance(config);
     this.proExchange = new ccxt.pro.binance(config);
+    this._lastFetchPosError = 0;
+    this._lastFetchOrdersError = 0;
+    this._lastBalanceError = 0;
   }
 
   toRawSymbol(symbol) {
-    if (!symbol) return '';
-    // E.g. 'DOGE/USDT:USDT' -> 'DOGEUSDT', 'DOGE/USDT' -> 'DOGEUSDT', 'DOGEUSDT' -> 'DOGEUSDT'
-    return symbol.replace(/[/:]/g, '').replace(/USDTUSDT$/i, 'USDT').toUpperCase();
+    if (!symbol || typeof symbol !== 'string') return '';
+    return symbol
+      .trim()
+      .replace(/[/:]/g, '')
+      .replace(/(USDT|BUSD|USDC)\1$/i, '$1')
+      .toUpperCase();
   }
 
   toUnifiedSymbol(symbol) {
-    if (!symbol) return '';
+    if (!symbol || typeof symbol !== 'string') return '';
     const raw = this.toRawSymbol(symbol);
-    if (this.exchange.markets && this.exchange.markets[raw]) {
-      return this.exchange.markets[raw].symbol;
+    
+    if (this.exchange.markets) {
+      if (this.exchange.markets[raw]?.symbol) {
+        return this.exchange.markets[raw].symbol;
+      }
+      if (this.exchange.markets_by_id && Array.isArray(this.exchange.markets_by_id[raw]) && this.exchange.markets_by_id[raw][0]?.symbol) {
+        return this.exchange.markets_by_id[raw][0].symbol;
+      }
+      const match = Object.values(this.exchange.markets).find(m => m?.id === raw);
+      if (match?.symbol) return match.symbol;
     }
+    
     // Standard USD-M futures unified format
     if (raw.endsWith('USDT')) {
       const base = raw.replace(/USDT$/, '');
@@ -52,11 +67,9 @@ class BinanceService {
 
   async initializeHedgeMode() {
     try {
-      // Load markets to get precision rules for coins
       await this.exchange.loadMarkets();
       console.log('✅ Exchange Markets Loaded (Precision Data OK)');
       
-      // Check current position mode
       const response = await this.exchange.fapiPrivateGetPositionSideDual();
       const isHedgeMode = response.dualSidePosition;
       
@@ -68,8 +81,7 @@ class BinanceService {
         console.log('✅ Account is already in Hedge Mode.');
       }
     } catch (err) {
-      // Binance throws an error if we try to change it while positions are open
-      if (err.message && err.message.includes('-4059')) {
+      if (err.message && (err.message.includes('-4059') || err.message.includes('No need to change'))) {
         console.log('✅ Account is already in Hedge Mode.');
       } else {
         console.error('❌ Error configuring Hedge Mode:', err.message);
@@ -85,7 +97,9 @@ class BinanceService {
 
       const unifiedSymbol = this.toUnifiedSymbol(symbol);
       const rawSymbol = this.toRawSymbol(symbol);
-      const targetSymbol = this.exchange.markets[unifiedSymbol] ? unifiedSymbol : (this.exchange.markets[rawSymbol] ? rawSymbol : symbol);
+      const targetSymbol = this.exchange.markets[unifiedSymbol] 
+        ? unifiedSymbol 
+        : (this.exchange.markets[rawSymbol] ? rawSymbol : symbol);
 
       // Format dynamically using Binance's strict precision rules
       const quantity = this.exchange.amountToPrecision(targetSymbol, quantityRaw);
@@ -105,7 +119,7 @@ class BinanceService {
       }
       return order;
     } catch (err) {
-      console.error(`❌ Failed to place ${positionSide} order on ${symbol}:`, err.message);
+      console.error(`❌ Failed to place ${positionSide} ${side} order on ${symbol}:`, err.message);
       throw err;
     }
   }
@@ -113,9 +127,13 @@ class BinanceService {
   async getBalance() {
     try {
       const balance = await this.exchange.fetchBalance();
-      return balance?.USDT?.free || 0;
+      return parseFloat(balance?.USDT?.free || 0);
     } catch (err) {
-      console.error('❌ Failed to fetch free balance:', err.message);
+      const now = Date.now();
+      if (!this._lastBalanceError || now - this._lastBalanceError > 60000) {
+        console.error('❌ Failed to fetch free balance:', err.message);
+        this._lastBalanceError = now;
+      }
       throw err;
     }
   }
@@ -125,7 +143,11 @@ class BinanceService {
       const balance = await this.exchange.fetchBalance();
       return parseFloat(balance.info?.totalWalletBalance || balance?.USDT?.total || 0);
     } catch (err) {
-      console.error('❌ Failed to fetch total wallet balance:', err.message);
+      const now = Date.now();
+      if (!this._lastBalanceError || now - this._lastBalanceError > 60000) {
+        console.error('❌ Failed to fetch total wallet balance:', err.message);
+        this._lastBalanceError = now;
+      }
       throw err;
     }
   }
@@ -136,17 +158,21 @@ class BinanceService {
       const rawSymbol = this.toRawSymbol(symbol);
       const unifiedSymbol = this.toUnifiedSymbol(symbol);
       
-      const positions = await this.exchange.fetchPositions([unifiedSymbol]).catch(async () => {
-        // Fallback without filter if unifiedSymbol fails
-        return await this.exchange.fetchPositions();
-      });
+      let positions = [];
+      try {
+        positions = await this.exchange.fetchPositions([unifiedSymbol]);
+      } catch (_) {
+        positions = await this.exchange.fetchPositions();
+      }
+
+      if (!Array.isArray(positions)) return [];
 
       return positions.filter(p => {
         const matchesSymbol = p.symbol === unifiedSymbol || 
                               p.symbol === rawSymbol || 
                               p.info?.symbol === rawSymbol;
-        const hasContracts = Math.abs(parseFloat(p.contracts || 0)) > 0;
-        return matchesSymbol && hasContracts;
+        const contracts = Math.abs(parseFloat(p.contracts ?? p.info?.positionAmt ?? 0));
+        return matchesSymbol && contracts > 0;
       });
     } catch (err) {
       const now = Date.now();
@@ -171,17 +197,23 @@ class BinanceService {
         console.error(`❌ Failed to fetch open orders for ${symbol}:`, err.message);
         this._lastFetchOrdersError = now;
       }
-      throw err;
+      return []; // Return empty array on error so caller can proceed safely
     }
   }
 
   async cancelAllOrders(symbol) {
     try {
       await this.ensureMarketsLoaded();
-      const targetSymbol = this.toUnifiedSymbol(symbol);
+      const unifiedSymbol = this.toUnifiedSymbol(symbol);
+      const rawSymbol = this.toRawSymbol(symbol);
+      const targetSymbol = this.exchange.markets[unifiedSymbol] ? unifiedSymbol : rawSymbol;
       await this.exchange.cancelAllOrders(targetSymbol);
       console.log(`✅ Cancelled all open limit orders for ${symbol}`);
     } catch (err) {
+      // Ignore if no open orders to cancel (-2011)
+      if (err.message && err.message.includes('-2011')) {
+        return;
+      }
       console.error(`❌ Failed to cancel orders for ${symbol}:`, err.message);
       throw err;
     }
@@ -189,12 +221,13 @@ class BinanceService {
 
   async cancelOrdersBySide(symbol, positionSide) {
     try {
-      // positionSide must be 'LONG' or 'SHORT'
       const openOrders = await this.fetchOpenOrders(symbol);
       const matchingOrders = openOrders.filter(o => o.info && o.info.positionSide === positionSide);
       if (matchingOrders.length === 0) return;
 
-      const targetSymbol = this.toUnifiedSymbol(symbol);
+      const unifiedSymbol = this.toUnifiedSymbol(symbol);
+      const rawSymbol = this.toRawSymbol(symbol);
+      const targetSymbol = this.exchange.markets[unifiedSymbol] ? unifiedSymbol : rawSymbol;
 
       await Promise.allSettled(
         matchingOrders.map(async (order) => {
@@ -202,7 +235,6 @@ class BinanceService {
             await this.exchange.cancelOrder(order.id, targetSymbol);
             console.log(`✅ Cleaned up old ${positionSide} limit order (${order.id})`);
           } catch (cancelErr) {
-            // Ignore -2011 (Unknown order / already filled)
             if (!cancelErr.message || !cancelErr.message.includes('-2011')) {
               console.warn(`⚠️ Warning cancelling ${positionSide} order (${order.id}):`, cancelErr.message);
             }
@@ -223,7 +255,7 @@ class BinanceService {
       });
       console.log(`✅ Margin mode strictly set to CROSSED for ${symbol}`);
     } catch (err) {
-      // Binance throws -4046 if it's already set to CROSSED, or -4059 if positions are open
+      // Binance throws -4046 if already set to CROSSED, -4059 if positions are open
       if (!err.message || (!err.message.includes('-4046') && !err.message.includes('-4059'))) {
         console.error(`❌ Failed to set CROSSED margin:`, err.message);
         throw err;
@@ -234,17 +266,15 @@ class BinanceService {
   async setLeverage(symbol, leverage) {
     try {
       const rawSymbol = this.toRawSymbol(symbol);
-      // 1. Force Cross Margin FIRST
       await this.setMarginMode(symbol);
       
-      // 2. Set Leverage
       await this.exchange.fapiPrivatePostLeverage({
         symbol: rawSymbol,
         leverage: leverage
       });
       console.log(`✅ Leverage strictly set to ${leverage}x for ${symbol}`);
     } catch (err) {
-      // Ignore if it's already set (-4028)
+      // Ignore if already set (-4028)
       if (!err.message || !err.message.includes('-4028')) {
         console.error(`❌ Failed to set leverage to ${leverage}:`, err.message);
         throw err;
@@ -254,4 +284,3 @@ class BinanceService {
 }
 
 export default new BinanceService();
-

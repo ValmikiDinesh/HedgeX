@@ -1,7 +1,7 @@
 import mongoose from 'mongoose';
 
 const tradeHistorySchema = new mongoose.Schema({
-  symbol: { type: String, required: true },
+  symbol: { type: String, required: true, index: true },
   side: { type: String, required: true, enum: ['LONG', 'SHORT'] },
   entryPrice: { type: Number, required: true },
   exitPrice: { type: Number, required: true },
@@ -13,6 +13,7 @@ const tradeHistorySchema = new mongoose.Schema({
 });
 
 tradeHistorySchema.index({ closedAt: -1 });
+tradeHistorySchema.index({ symbol: 1, closedAt: -1 });
 
 const TradeHistory = mongoose.model('TradeHistory', tradeHistorySchema);
 

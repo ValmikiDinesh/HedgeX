@@ -53,7 +53,7 @@ app.get('/api/status', async (req, res) => {
         marginRatio = 100.0;
       }
     } catch (apiErr) {
-      // Binance API might be disconnected, IP restricted, or unconfigured
+      // Binance private API may be unconfigured, IP restricted, or offline
     }
 
     let totalRealizedPnl = 0;
@@ -85,10 +85,18 @@ app.get('/api/grid', async (req, res) => {
     
     let positions = [];
     let livePrice = null;
+    
     try {
       positions = await binanceService.fetchOpenPositions(rawSymbol);
+    } catch (apiErr) {
+      // Binance private API may fail if API key is invalid/unconfigured
+    }
+
+    try {
       livePrice = await marketAgent.getCurrentPrice(rawSymbol);
-    } catch (apiErr) {}
+    } catch (priceErr) {
+      console.error('Failed to get live price:', priceErr.message);
+    }
 
     const longPos = positions.find(p => (p.info?.positionSide === 'LONG') || (p.side === 'long'));
     const shortPos = positions.find(p => (p.info?.positionSide === 'SHORT') || (p.side === 'short'));
@@ -98,7 +106,7 @@ app.get('/api/grid', async (req, res) => {
       if (!pos) return null;
       const entryPrice = parseFloat(pos.info?.entryPrice || pos.entryPrice || 0);
       const safePrice = (currentPrice && currentPrice > 0) ? currentPrice : entryPrice;
-      const qty = Math.abs(parseFloat(pos.contracts || 0));
+      const qty = Math.abs(parseFloat(pos.contracts ?? pos.info?.positionAmt ?? 0));
       const rawGrossPnl = parseFloat(pos.info?.unRealizedProfit || pos.unrealizedPnl || 0);
       const grossPnl = Math.abs(rawGrossPnl) < 0.00001 ? 0 : rawGrossPnl;
       
@@ -140,45 +148,80 @@ app.get('/api/settings', async (req, res) => {
 });
 
 let isUpdatingSettings = false;
+let updateSettingsTimeout = null;
+
 app.post('/api/settings', async (req, res) => {
-  if (isUpdatingSettings) return res.status(429).json({ error: 'Settings update in progress. Please wait.' });
+  if (isUpdatingSettings) {
+    return res.status(429).json({ error: 'Settings update in progress. Please wait.' });
+  }
   isUpdatingSettings = true;
+  
+  // Guard lock against hanging indefinitely
+  clearTimeout(updateSettingsTimeout);
+  updateSettingsTimeout = setTimeout(() => { isUpdatingSettings = false; }, 15000);
+
   try {
     const updates = req.body;
     delete updates.singletonId;
-    if (updates.symbol) {
-      updates.symbol = binanceService.toRawSymbol(updates.symbol);
+
+    if (updates.symbol !== undefined) {
+      const sanitized = binanceService.toRawSymbol(updates.symbol);
+      if (!sanitized || sanitized.length < 3 || sanitized.length > 20) {
+        return res.status(400).json({ error: 'Invalid trading pair symbol' });
+      }
+      updates.symbol = sanitized;
     }
+
     if (updates.gridPercentage !== undefined) {
       updates.gridPercentage = parseFloat(updates.gridPercentage);
-      if (isNaN(updates.gridPercentage) || updates.gridPercentage < 0.001 || updates.gridPercentage > 0.50) return res.status(400).json({ error: 'Grid profit target must be between 0.1% and 50%' });
+      if (isNaN(updates.gridPercentage) || updates.gridPercentage < 0.001 || updates.gridPercentage > 0.50) {
+        return res.status(400).json({ error: 'Grid profit target must be between 0.1% and 50%' });
+      }
     }
+
     if (updates.positionPercentage !== undefined) {
       updates.positionPercentage = parseFloat(updates.positionPercentage);
-      if (isNaN(updates.positionPercentage) || updates.positionPercentage < 0.01 || updates.positionPercentage > 0.50) return res.status(400).json({ error: 'Position size must be between 1% and 50%' });
+      if (isNaN(updates.positionPercentage) || updates.positionPercentage < 0.01 || updates.positionPercentage > 0.50) {
+        return res.status(400).json({ error: 'Position size must be between 1% and 50%' });
+      }
     }
+
     if (updates.leverage !== undefined) {
       updates.leverage = parseInt(updates.leverage);
-      if (isNaN(updates.leverage) || updates.leverage < 1 || updates.leverage > 125) return res.status(400).json({ error: 'Leverage must be between 1x and 125x' });
+      if (isNaN(updates.leverage) || updates.leverage < 1 || updates.leverage > 125) {
+        return res.status(400).json({ error: 'Leverage must be between 1x and 125x' });
+      }
     }
+
     if (updates.tradingEnabled !== undefined) {
       updates.tradingEnabled = Boolean(updates.tradingEnabled);
     }
+
     if (updates.useDynamicGrid !== undefined) {
       updates.useDynamicGrid = Boolean(updates.useDynamicGrid);
     }
+
     if (updates.minGridPercentage !== undefined) {
       updates.minGridPercentage = parseFloat(updates.minGridPercentage);
-      if (isNaN(updates.minGridPercentage) || updates.minGridPercentage < 0.001 || updates.minGridPercentage > 0.10) return res.status(400).json({ error: 'Min grid must be between 0.1% and 10%' });
+      if (isNaN(updates.minGridPercentage) || updates.minGridPercentage < 0.001 || updates.minGridPercentage > 0.10) {
+        return res.status(400).json({ error: 'Min grid must be between 0.1% and 10%' });
+      }
     }
+
     if (updates.maxGridPercentage !== undefined) {
       updates.maxGridPercentage = parseFloat(updates.maxGridPercentage);
-      if (isNaN(updates.maxGridPercentage) || updates.maxGridPercentage < 0.005 || updates.maxGridPercentage > 0.50) return res.status(400).json({ error: 'Max grid must be between 0.5% and 50%' });
+      if (isNaN(updates.maxGridPercentage) || updates.maxGridPercentage < 0.005 || updates.maxGridPercentage > 0.50) {
+        return res.status(400).json({ error: 'Max grid must be between 0.5% and 50%' });
+      }
     }
+
     if (updates.maxDcaLayers !== undefined) {
       updates.maxDcaLayers = parseInt(updates.maxDcaLayers);
-      if (isNaN(updates.maxDcaLayers) || updates.maxDcaLayers < 0 || updates.maxDcaLayers > 10) return res.status(400).json({ error: 'Max DCA layers must be between 0 and 10' });
+      if (isNaN(updates.maxDcaLayers) || updates.maxDcaLayers < 0 || updates.maxDcaLayers > 10) {
+        return res.status(400).json({ error: 'Max DCA layers must be between 0 and 10' });
+      }
     }
+
     if (updates.stopLossPercentage !== undefined) {
       updates.stopLossPercentage = parseFloat(updates.stopLossPercentage);
       if (isNaN(updates.stopLossPercentage) || updates.stopLossPercentage < 0 || updates.stopLossPercentage > 0.50) {
@@ -217,6 +260,7 @@ app.post('/api/settings', async (req, res) => {
   } catch (err) {
     res.status(500).json({ error: 'Failed to update settings' });
   } finally {
+    clearTimeout(updateSettingsTimeout);
     isUpdatingSettings = false;
   }
 });
@@ -245,7 +289,10 @@ server.listen(PORT, () => {
 });
 
 // 4. Initialize Bot Services (MongoDB, Binance, Strategy Loop)
+let botInitialized = false;
+
 async function startBot() {
+  if (botInitialized) return;
   console.log('🤖 Initializing AI Hedge Bot...');
   
   try {
@@ -258,23 +305,42 @@ async function startBot() {
     return;
   }
 
+  botInitialized = true;
+
   // Setup live price emitter
   let lastEmitTime = 0;
   marketAgent.on('price_tick', (price) => {
     const now = Date.now();
     if (now - lastEmitTime > 150) {
-      io.emit('price_update', { symbol: marketAgent.currentSymbol, price });
+      const rawSymbol = binanceService.toRawSymbol(marketAgent.currentSymbol);
+      io.emit('price_update', { 
+        symbol: rawSymbol,
+        unifiedSymbol: marketAgent.currentSymbol, 
+        price 
+      });
       lastEmitTime = now;
+    }
+  });
+
+  // Emit current price immediately whenever a client connects
+  io.on('connection', (socket) => {
+    if (marketAgent.livePrice) {
+      const rawSymbol = binanceService.toRawSymbol(marketAgent.currentSymbol);
+      socket.emit('price_update', {
+        symbol: rawSymbol,
+        unifiedSymbol: marketAgent.currentSymbol,
+        price: marketAgent.livePrice
+      });
     }
   });
 
   // Load settings to start watching symbol immediately
   try {
-    const settings = await BotSettings.findOne({ singletonId: 'default_settings' }) || new BotSettings();
-    if (!settings.isNew) {
-      marketAgent.startWatching(settings.symbol);
-    }
-  } catch (_) {}
+    const settings = await BotSettings.findOne({ singletonId: 'default_settings' }) || await BotSettings.create({ singletonId: 'default_settings' });
+    marketAgent.startWatching(settings.symbol || 'DOGEUSDT');
+  } catch (_) {
+    marketAgent.startWatching('DOGEUSDT');
+  }
 
   // Initialize Binance Hedge Mode
   try {
@@ -285,7 +351,7 @@ async function startBot() {
     console.log('⚠️ Automated trading will run in monitoring/self-healing mode until Binance credentials/IP are verified.');
   }
 
-  // Always start the Grid Loop interval regardless of initial transient errors
+  // Start the Grid Loop interval
   gridStrategyAgent.runGridLoop().catch(err => console.error('Initial grid loop error:', err.message));
   setInterval(async () => {
     try {
@@ -296,5 +362,23 @@ async function startBot() {
   }, 10000);
 }
 
-startBot();
+// Graceful Shutdown
+const handleShutdown = async (signal) => {
+  console.log(`\n🛑 Received ${signal}. Shutting down gracefully...`);
+  try {
+    marketAgent.stopWatching();
+    await mongoose.connection.close();
+    server.close(() => {
+      console.log('✅ Server stopped cleanly.');
+      process.exit(0);
+    });
+  } catch (err) {
+    console.error('Error during shutdown:', err);
+    process.exit(1);
+  }
+};
 
+process.on('SIGINT', () => handleShutdown('SIGINT'));
+process.on('SIGTERM', () => handleShutdown('SIGTERM'));
+
+startBot();

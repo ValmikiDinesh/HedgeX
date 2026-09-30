@@ -1,26 +1,66 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import axios from 'axios';
 import { io } from 'socket.io-client';
-import { Activity, Wallet, ShieldAlert, Bot, Settings, X } from 'lucide-react';
+import { 
+  Bot, 
+  Wallet, 
+  ShieldAlert, 
+  Settings, 
+  X, 
+  Check, 
+  Activity, 
+  Sliders, 
+  Zap, 
+  TrendingUp,
+  AlertTriangle,
+  Wifi,
+  WifiOff
+} from 'lucide-react';
 import GridLegCard from './components/GridLegCard';
 import './index.css';
+
+const PRESET_SYMBOLS = ['DOGEUSDT', 'BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'XRPUSDT'];
 
 function App() {
   const [status, setStatus] = useState({ balance: 0, marginRatio: 0, totalRealizedPnl: 0 });
   const [gridData, setGridData] = useState({ livePositions: { long: null, short: null }, livePrice: null });
   const [tradeHistory, setTradeHistory] = useState([]);
-  const [settings, setSettings] = useState({ symbol: 'DOGEUSDT', gridPercentage: 0.015, positionPercentage: 0.20, leverage: 10, tradingEnabled: true, maxDcaLayers: 3, stopLossPercentage: 0.05 });
+  const [settings, setSettings] = useState({ 
+    symbol: 'DOGEUSDT', 
+    gridPercentage: 0.015, 
+    positionPercentage: 0.20, 
+    leverage: 10, 
+    tradingEnabled: true, 
+    maxDcaLayers: 3, 
+    stopLossPercentage: 0.05,
+    useDynamicGrid: true,
+    minGridPercentage: 0.0035,
+    maxGridPercentage: 0.035
+  });
   const [loading, setLoading] = useState(true);
+  const [priceFlash, setPriceFlash] = useState(false);
+  const [saveSuccess, setSaveSuccess] = useState(false);
+  const [saveError, setSaveError] = useState(null);
+  const [isWsConnected, setIsWsConnected] = useState(false);
   
   // Modal State
   const [showSettings, setShowSettings] = useState(false);
   const [formData, setFormData] = useState({ 
-    ...settings,
-    gridPercentage: settings.gridPercentage * 100,
-    positionPercentage: settings.positionPercentage * 100,
-    stopLossPercentage: (settings.stopLossPercentage ?? 0.05) * 100
+    symbol: 'DOGEUSDT',
+    gridPercentage: 1.5,
+    positionPercentage: 20,
+    leverage: 10,
+    tradingEnabled: true,
+    maxDcaLayers: 3,
+    stopLossPercentage: 5.0,
+    useDynamicGrid: true,
+    minGridPercentage: 0.35,
+    maxGridPercentage: 3.5
   });
   const [saving, setSaving] = useState(false);
+
+  // Helper to normalize crypto symbols for safe comparison
+  const normalizeSymbol = (s) => (s || '').replace(/[/:]/g, '').replace(/USDTUSDT$/i, 'USDT').toUpperCase();
 
   const fetchData = async () => {
     try {
@@ -30,22 +70,32 @@ function App() {
         axios.get('/api/settings'),
         axios.get('/api/history')
       ]);
+
       setStatus(statusRes.data || { balance: 0, marginRatio: 0, totalRealizedPnl: 0 });
-      // Only update grid positions from REST, leave livePrice to be handled by WebSocket or fallback
+      
       setGridData(prev => ({
         ...gridRes.data,
-        livePrice: prev.livePrice || gridRes.data?.livePrice
+        livePrice: (gridRes.data?.livePrice !== null && gridRes.data?.livePrice !== undefined) 
+          ? gridRes.data.livePrice 
+          : prev.livePrice
       }));
+
       setTradeHistory(Array.isArray(historyRes.data) ? historyRes.data : []);
       
-      // Only update local settings if modal is not open to avoid overwriting user input
       if (!showSettings && settingsRes.data) {
-        setSettings(settingsRes.data);
+        const s = settingsRes.data;
+        setSettings(s);
         setFormData({
-          ...settingsRes.data,
-          gridPercentage: parseFloat((settingsRes.data.gridPercentage * 100).toFixed(4)),
-          positionPercentage: parseFloat((settingsRes.data.positionPercentage * 100).toFixed(4)),
-          stopLossPercentage: parseFloat(((settingsRes.data.stopLossPercentage ?? 0.05) * 100).toFixed(2))
+          symbol: s.symbol || 'DOGEUSDT',
+          gridPercentage: parseFloat(((s.gridPercentage ?? 0.015) * 100).toFixed(4)),
+          positionPercentage: parseFloat(((s.positionPercentage ?? 0.20) * 100).toFixed(4)),
+          leverage: parseInt(s.leverage) || 1,
+          tradingEnabled: s.tradingEnabled !== false,
+          maxDcaLayers: parseInt(s.maxDcaLayers ?? 3),
+          stopLossPercentage: parseFloat(((s.stopLossPercentage ?? 0.05) * 100).toFixed(2)),
+          useDynamicGrid: s.useDynamicGrid !== false,
+          minGridPercentage: parseFloat(((s.minGridPercentage ?? 0.0035) * 100).toFixed(2)),
+          maxGridPercentage: parseFloat(((s.maxGridPercentage ?? 0.035) * 100).toFixed(2))
         });
       }
       setLoading(false);
@@ -60,37 +110,102 @@ function App() {
     return () => clearInterval(interval);
   }, [showSettings]);
 
+  // Real-time WebSocket Price Stream
   useEffect(() => {
     const socket = io();
+    
+    socket.on('connect', () => setIsWsConnected(true));
+    socket.on('disconnect', () => setIsWsConnected(false));
+
     socket.on('price_update', (data) => {
       if (typeof data === 'object' && data !== null) {
-        if (!data.symbol || data.symbol === settings.symbol) {
+        const updateSym = normalizeSymbol(data.symbol || data.unifiedSymbol);
+        const currentSym = normalizeSymbol(settings.symbol);
+        
+        if (!updateSym || updateSym === currentSym) {
           setGridData(prev => ({ ...prev, livePrice: data.price }));
+          setPriceFlash(true);
+          setTimeout(() => setPriceFlash(false), 300);
         }
-      } else {
+      } else if (typeof data === 'number') {
         setGridData(prev => ({ ...prev, livePrice: data }));
       }
     });
+
     return () => socket.disconnect();
   }, [settings.symbol]);
+
+  // Handle ESC key to dismiss modal
+  useEffect(() => {
+    const handleKeyDown = (e) => {
+      if (e.key === 'Escape' && showSettings) {
+        setShowSettings(false);
+      }
+    };
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [showSettings]);
+
+  const handleOpenSettings = () => {
+    setFormData({
+      symbol: settings.symbol || 'DOGEUSDT',
+      gridPercentage: parseFloat(((settings.gridPercentage ?? 0.015) * 100).toFixed(4)),
+      positionPercentage: parseFloat(((settings.positionPercentage ?? 0.20) * 100).toFixed(4)),
+      leverage: parseInt(settings.leverage) || 1,
+      tradingEnabled: settings.tradingEnabled !== false,
+      maxDcaLayers: parseInt(settings.maxDcaLayers ?? 3),
+      stopLossPercentage: parseFloat(((settings.stopLossPercentage ?? 0.05) * 100).toFixed(2)),
+      useDynamicGrid: settings.useDynamicGrid !== false,
+      minGridPercentage: parseFloat(((settings.minGridPercentage ?? 0.0035) * 100).toFixed(2)),
+      maxGridPercentage: parseFloat(((settings.maxGridPercentage ?? 0.035) * 100).toFixed(2))
+    });
+    setSaveSuccess(false);
+    setSaveError(null);
+    setShowSettings(true);
+  };
 
   const handleSaveSettings = async (e) => {
     e.preventDefault();
     setSaving(true);
+    setSaveSuccess(false);
+    setSaveError(null);
+
+    // Client-side validation
+    const cleanSym = normalizeSymbol(formData.symbol);
+    if (!cleanSym || cleanSym.length < 3) {
+      setSaveError('Please enter a valid coin pair symbol (e.g. DOGEUSDT)');
+      setSaving(false);
+      return;
+    }
+
     try {
       const parsedStopLoss = parseFloat(formData.stopLossPercentage);
       const payload = {
-        ...formData,
+        symbol: cleanSym,
         gridPercentage: parseFloat(formData.gridPercentage) / 100,
         positionPercentage: parseFloat(formData.positionPercentage) / 100,
-        stopLossPercentage: !isNaN(parsedStopLoss) ? (parsedStopLoss / 100) : 0.05
+        leverage: parseInt(formData.leverage) || 1,
+        maxDcaLayers: parseInt(formData.maxDcaLayers) || 0,
+        stopLossPercentage: !isNaN(parsedStopLoss) ? (parsedStopLoss / 100) : 0.05,
+        tradingEnabled: Boolean(formData.tradingEnabled),
+        useDynamicGrid: Boolean(formData.useDynamicGrid),
+        minGridPercentage: (parseFloat(formData.minGridPercentage) || 0.35) / 100,
+        maxGridPercentage: (parseFloat(formData.maxGridPercentage) || 3.5) / 100,
       };
-      await axios.post('/api/settings', payload);
-      setShowSettings(false);
-      fetchData(); // Refresh UI
+
+      const res = await axios.post('/api/settings', payload);
+      if (res.data) {
+        setSettings(res.data);
+      }
+      setSaveSuccess(true);
+      setTimeout(() => {
+        setShowSettings(false);
+        setSaveSuccess(false);
+      }, 600);
+      fetchData();
     } catch (err) {
       console.error(err);
-      alert('Failed to save settings: ' + (err.response?.data?.error || err.message));
+      setSaveError(err.response?.data?.error || err.message || 'Failed to save configuration');
     } finally {
       setSaving(false);
     }
@@ -99,37 +214,49 @@ function App() {
   const isMarginSafe = (parseFloat(status.marginRatio) || 0) < 80;
 
   const formatPrice = (p) => {
-    if (!p || isNaN(p)) return 'Loading...';
+    if (p === null || p === undefined || isNaN(p) || parseFloat(p) <= 0) return 'Loading...';
     const num = parseFloat(p);
-    if (num >= 100) return `$${num.toFixed(2)}`;
+    if (num >= 1000) return `$${num.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
     if (num >= 1) return `$${num.toFixed(4)}`;
     return `$${num.toFixed(5)}`;
   };
 
   return (
     <div className="app-container">
+      {/* Header */}
       <header className="dashboard-header">
-        <div className="header-title">
-          <Bot className="icon-spin" size={32} />
-          AI Hedge Bot
+        <div className="header-brand">
+          <div className="brand-icon-wrap">
+            <Bot size={26} className={settings.tradingEnabled ? "icon-spin" : ""} />
+          </div>
+          <div className="brand-info">
+            <h1>HedgeX Bot</h1>
+            <div className="brand-subtitle">
+              <span className={`live-indicator ${settings.tradingEnabled ? '' : 'inactive'}`} />
+              <span>{settings.symbol} &bull; {settings.tradingEnabled ? 'Trading Active' : 'Trading Paused'}</span>
+              <span style={{ marginLeft: '4px', opacity: 0.8 }}>
+                {isWsConnected ? '• WS Live' : '• WS Connecting'}
+              </span>
+            </div>
+          </div>
         </div>
         
         <div className="stats-container">
           <div className="stat-pill">
             <span className="stat-label">Live Price:</span>
-            <span className="stat-value" style={{color: "var(--text-primary)"}}>
+            <span className={`stat-value highlight ${priceFlash ? 'price-pulse' : ''}`}>
               {formatPrice(gridData.livePrice)}
             </span>
           </div>
 
           <div className="stat-pill">
-            <Wallet size={16} className="stat-label" />
+            <Wallet size={15} className="stat-label" />
             <span className="stat-label">Balance:</span>
             <span className="stat-value">${parseFloat(status?.balance || 0).toFixed(2)}</span>
           </div>
           
           <div className="stat-pill">
-            <ShieldAlert size={16} className={isMarginSafe ? 'stat-value safe' : 'stat-value danger'} />
+            <ShieldAlert size={15} className={isMarginSafe ? 'stat-value safe' : 'stat-value danger'} />
             <span className="stat-label">Margin:</span>
             <span className={isMarginSafe ? 'stat-value safe' : 'stat-value danger'}>
               {status.marginRatio}%
@@ -143,17 +270,23 @@ function App() {
             </span>
           </div>
 
-          <button className="settings-btn" onClick={() => setShowSettings(true)}>
-            <Settings size={20} />
+          <button 
+            type="button" 
+            className="settings-btn" 
+            title="Configure Bot Settings"
+            onClick={handleOpenSettings}
+          >
+            <Settings size={18} />
           </button>
         </div>
       </header>
 
+      {/* Main Grid Section */}
       <main>
         {loading ? (
           <div className="empty-state">
-            <Activity className="empty-icon icon-spin" size={48} />
-            <p>Connecting to Exchange...</p>
+            <Activity className="empty-icon icon-spin" size={44} />
+            <p>Connecting to Exchange & Loading Grid State...</p>
           </div>
         ) : (
           <div className="grid-container">
@@ -175,9 +308,12 @@ function App() {
         {/* Trade History Section */}
         {!loading && (
           <div className="history-section">
-            <h3 className="history-title">Recent Completed Trades</h3>
+            <h3 className="history-title">
+              <TrendingUp size={18} style={{ color: 'var(--primary)' }} />
+              Recent Completed Trades
+            </h3>
             {!Array.isArray(tradeHistory) || tradeHistory.length === 0 ? (
-              <div className="empty-history">No completed trades yet.</div>
+              <div className="empty-history">No completed trades yet. When legs hit take-profit or stop-loss, executions appear here.</div>
             ) : (
               <div className="table-responsive">
                 <table className="history-table">
@@ -186,8 +322,8 @@ function App() {
                       <th>Time</th>
                       <th>Asset</th>
                       <th>Side</th>
-                      <th>Entry</th>
-                      <th>Exit</th>
+                      <th>Entry Price</th>
+                      <th>Exit Price</th>
                       <th>Gross PnL</th>
                       <th>Net PnL</th>
                     </tr>
@@ -197,14 +333,18 @@ function App() {
                       <tr key={trade._id || idx}>
                         <td>{trade.closedAt ? new Date(trade.closedAt).toLocaleTimeString() : 'N/A'}</td>
                         <td>{trade.symbol}</td>
-                        <td className={trade.side === 'LONG' ? 'text-green' : 'text-red'}>{trade.side}</td>
+                        <td>
+                          <span className={`badge ${trade.side === 'LONG' ? 'safe' : 'warning'}`}>
+                            {trade.side}
+                          </span>
+                        </td>
                         <td>{formatPrice(trade.entryPrice)}</td>
                         <td>{formatPrice(trade.exitPrice)}</td>
                         <td className={(parseFloat(trade.grossPnl) || 0) >= 0 ? 'text-green' : 'text-red'}>
-                          {(parseFloat(trade.grossPnl) || 0) >= 0 ? '+' : ''}{Number(trade.grossPnl || 0).toFixed(4)}
+                          {(parseFloat(trade.grossPnl) || 0) >= 0 ? '+' : ''}{Number(trade.grossPnl || 0).toFixed(4)} USDT
                         </td>
-                        <td className={(parseFloat(trade.netPnl) || 0) >= 0 ? 'text-green' : 'text-red'} style={{fontWeight: 'bold'}}>
-                          {(parseFloat(trade.netPnl) || 0) >= 0 ? '+' : ''}{Number(trade.netPnl || 0).toFixed(4)}
+                        <td className={(parseFloat(trade.netPnl) || 0) >= 0 ? 'text-green' : 'text-red'} style={{ fontWeight: '700' }}>
+                          {(parseFloat(trade.netPnl) || 0) >= 0 ? '+' : ''}{Number(trade.netPnl || 0).toFixed(4)} USDT
                         </td>
                       </tr>
                     ))}
@@ -216,115 +356,294 @@ function App() {
         )}
       </main>
 
-      {/* Settings Modal */}
+      {/* Settings Modal (Always scrollable, visible close & save buttons) */}
       {showSettings && (
-        <div className="modal-overlay">
-          <div className="modal-content">
+        <div className="modal-overlay" onClick={(e) => { if (e.target === e.currentTarget) setShowSettings(false); }}>
+          <div className="modal-content" onClick={(e) => e.stopPropagation()}>
+            {/* Fixed Header */}
             <div className="modal-header">
-              <h2>Bot Configuration</h2>
-              <button className="close-btn" onClick={() => setShowSettings(false)}>
-                <X size={24} />
+              <div className="modal-title-wrap">
+                <Sliders size={20} className="modal-title-icon" />
+                <h2>Bot Configuration</h2>
+              </div>
+              <button 
+                type="button" 
+                className="close-btn" 
+                title="Close (Esc)"
+                onClick={() => setShowSettings(false)}
+              >
+                <X size={18} />
               </button>
             </div>
             
-            <form onSubmit={handleSaveSettings}>
-              <div className="form-group">
-                <label>Trading Pair Symbol</label>
-                <input 
-                  type="text" 
-                  value={formData.symbol} 
-                  onChange={(e) => setFormData({...formData, symbol: e.target.value.toUpperCase()})}
-                  placeholder="e.g. DOGEUSDT"
-                  required
-                />
-                <small>WARNING: Changing this will panic-close active grids on the old coin.</small>
+            {/* Scrollable Body Form */}
+            <form onSubmit={handleSaveSettings} className="modal-form">
+              <div className="modal-body">
+
+                {saveError && (
+                  <div style={{
+                    padding: '10px 14px',
+                    borderRadius: '8px',
+                    background: 'var(--loss-red-bg)',
+                    border: '1px solid var(--loss-red)',
+                    color: 'var(--loss-red)',
+                    fontSize: '0.85rem',
+                    display: 'flex',
+                    alignItems: 'center',
+                    gap: '8px'
+                  }}>
+                    <AlertTriangle size={16} />
+                    <span>{saveError}</span>
+                  </div>
+                )}
+                
+                {/* 1. Global Killswitch */}
+                <div 
+                  className={`switch-card ${formData.tradingEnabled ? 'active' : ''}`}
+                  onClick={() => setFormData({ ...formData, tradingEnabled: !formData.tradingEnabled })}
+                >
+                  <div className="switch-info">
+                    <h4>Automated Trading Engine</h4>
+                    <p>{formData.tradingEnabled ? 'Bot actively places & manages hedge grid orders' : 'Trading paused — existing positions remain protected'}</p>
+                  </div>
+                  <label className="toggle-switch" onClick={(e) => e.stopPropagation()}>
+                    <input 
+                      type="checkbox" 
+                      checked={formData.tradingEnabled}
+                      onChange={(e) => setFormData({ ...formData, tradingEnabled: e.target.checked })}
+                    />
+                    <span className="slider"></span>
+                  </label>
+                </div>
+
+                {/* Section: Market & Pair */}
+                <div className="form-section-title">
+                  <Zap size={14} /> Market & Position Sizing
+                </div>
+
+                <div className="form-group">
+                  <label>
+                    Trading Pair Symbol
+                    <span className="label-hint">USDⓈ-M Futures</span>
+                  </label>
+                  <input 
+                    type="text" 
+                    className="form-input"
+                    value={formData.symbol} 
+                    onChange={(e) => setFormData({...formData, symbol: e.target.value.toUpperCase()})}
+                    placeholder="e.g. DOGEUSDT"
+                    required
+                  />
+                  <div className="chips-row">
+                    {PRESET_SYMBOLS.map(sym => (
+                      <button 
+                        key={sym} 
+                        type="button" 
+                        className={`chip ${formData.symbol === sym ? 'active' : ''}`}
+                        onClick={() => setFormData({ ...formData, symbol: sym })}
+                      >
+                        {sym}
+                      </button>
+                    ))}
+                  </div>
+                  <small className="warning-text">⚠️ Changing coin symbol will automatically close active grids on the previous asset.</small>
+                </div>
+
+                <div className="two-col-grid">
+                  <div className="form-group">
+                    <label>Position Capital</label>
+                    <div className="input-with-unit">
+                      <input 
+                        type="number" 
+                        className="form-input has-unit"
+                        step="0.1"
+                        min="1"
+                        max="50"
+                        value={formData.positionPercentage} 
+                        onChange={(e) => setFormData({...formData, positionPercentage: parseFloat(e.target.value) || 0})}
+                        required
+                      />
+                      <span className="input-unit">%</span>
+                    </div>
+                    <small>Allocated per leg (1% - 50%)</small>
+                  </div>
+
+                  <div className="form-group">
+                    <label>Leverage</label>
+                    <div className="input-with-unit">
+                      <input 
+                        type="number" 
+                        className="form-input has-unit"
+                        step="1"
+                        min="1"
+                        max="125"
+                        value={formData.leverage} 
+                        onChange={(e) => setFormData({...formData, leverage: parseInt(e.target.value) || 1})}
+                        required
+                      />
+                      <span className="input-unit">x</span>
+                    </div>
+                    <small>Isolated/Cross leverage (1x - 125x)</small>
+                  </div>
+                </div>
+
+                {/* Section: Grid & Safety */}
+                <div className="form-section-title">
+                  <Sliders size={14} /> Grid & DCA Execution
+                </div>
+
+                <div className="two-col-grid">
+                  <div className="form-group">
+                    <label>Grid Profit Target</label>
+                    <div className="input-with-unit">
+                      <input 
+                        type="number" 
+                        className="form-input has-unit"
+                        step="0.01"
+                        min="0.1"
+                        max="50"
+                        value={formData.gridPercentage} 
+                        onChange={(e) => setFormData({...formData, gridPercentage: parseFloat(e.target.value) || 0})}
+                        required
+                      />
+                      <span className="input-unit">%</span>
+                    </div>
+                    <small>Profit spread per grid cycle</small>
+                  </div>
+
+                  <div className="form-group">
+                    <label>Max DCA Layers</label>
+                    <div className="input-with-unit">
+                      <input 
+                        type="number" 
+                        className="form-input has-unit"
+                        step="1"
+                        min="0"
+                        max="10"
+                        value={formData.maxDcaLayers} 
+                        onChange={(e) => setFormData({...formData, maxDcaLayers: parseInt(e.target.value) || 0})}
+                        required
+                      />
+                      <span className="input-unit">lvls</span>
+                    </div>
+                    <small>Safety orders per side (0 - 10)</small>
+                  </div>
+                </div>
+
+                <div className="form-group">
+                  <label>
+                    Position Stop-Loss
+                    <span className="label-hint">Emergency Risk Guard</span>
+                  </label>
+                  <div className="input-with-unit">
+                    <input 
+                      type="number" 
+                      className="form-input has-unit"
+                      step="0.1"
+                      min="0"
+                      max="50"
+                      value={formData.stopLossPercentage} 
+                      onChange={(e) => setFormData({...formData, stopLossPercentage: e.target.value === '' ? '' : parseFloat(e.target.value)})}
+                      placeholder="e.g. 5.0 (0 to disable)"
+                      required
+                    />
+                    <span className="input-unit">%</span>
+                  </div>
+                  <small>Closes losing leg if price diverges beyond max DCA limits (set 0 to disable).</small>
+                </div>
+
+                {/* Section: Dynamic Volatility (ATR) */}
+                <div className="form-section-title">
+                  <TrendingUp size={14} /> Dynamic Volatility (ATR)
+                </div>
+
+                <div 
+                  className={`switch-card ${formData.useDynamicGrid ? 'active' : ''}`}
+                  onClick={() => setFormData({ ...formData, useDynamicGrid: !formData.useDynamicGrid })}
+                >
+                  <div className="switch-info">
+                    <h4>Dynamic ATR Grid Spacing</h4>
+                    <p>Auto-scales grid spacing dynamically with live 5m market volatility</p>
+                  </div>
+                  <label className="toggle-switch" onClick={(e) => e.stopPropagation()}>
+                    <input 
+                      type="checkbox" 
+                      checked={formData.useDynamicGrid}
+                      onChange={(e) => setFormData({ ...formData, useDynamicGrid: e.target.checked })}
+                    />
+                    <span className="slider"></span>
+                  </label>
+                </div>
+
+                {formData.useDynamicGrid && (
+                  <div className="two-col-grid">
+                    <div className="form-group">
+                      <label>Min Spacing Floor</label>
+                      <div className="input-with-unit">
+                        <input 
+                          type="number" 
+                          className="form-input has-unit"
+                          step="0.05"
+                          min="0.1"
+                          max="10"
+                          value={formData.minGridPercentage} 
+                          onChange={(e) => setFormData({...formData, minGridPercentage: parseFloat(e.target.value) || 0})}
+                        />
+                        <span className="input-unit">%</span>
+                      </div>
+                      <small>Minimum fee-safe spacing floor</small>
+                    </div>
+
+                    <div className="form-group">
+                      <label>Max Spacing Ceiling</label>
+                      <div className="input-with-unit">
+                        <input 
+                          type="number" 
+                          className="form-input has-unit"
+                          step="0.1"
+                          min="0.5"
+                          max="50"
+                          value={formData.maxGridPercentage} 
+                          onChange={(e) => setFormData({...formData, maxGridPercentage: parseFloat(e.target.value) || 0})}
+                        />
+                        <span className="input-unit">%</span>
+                      </div>
+                      <small>Maximum spacing in volatile swings</small>
+                    </div>
+                  </div>
+                )}
+
               </div>
 
-              <div className="form-group">
-                <label>Grid Profit Target (%)</label>
-                <input 
-                  type="number" 
-                  step="0.001"
-                  min="0.1"
-                  max="50"
-                  value={formData.gridPercentage} 
-                  onChange={(e) => setFormData({...formData, gridPercentage: parseFloat(e.target.value) || 0})}
-                  required
-                />
+              {/* Fixed Footer (Cancel & Save buttons always visible) */}
+              <div className="modal-footer">
+                <button 
+                  type="button" 
+                  className="btn-secondary"
+                  onClick={() => setShowSettings(false)}
+                >
+                  Cancel
+                </button>
+                <button 
+                  type="submit" 
+                  className="save-btn" 
+                  disabled={saving}
+                >
+                  {saving ? (
+                    <>
+                      <Activity size={16} className="icon-spin" />
+                      Saving...
+                    </>
+                  ) : saveSuccess ? (
+                    <>
+                      <Check size={16} />
+                      Saved!
+                    </>
+                  ) : (
+                    'Save Configuration'
+                  )}
+                </button>
               </div>
-
-              <div className="form-group">
-                <label>Position Size (% of Capital)</label>
-                <input 
-                  type="number" 
-                  step="0.1"
-                  min="1"
-                  max="50"
-                  value={formData.positionPercentage} 
-                  onChange={(e) => setFormData({...formData, positionPercentage: parseFloat(e.target.value) || 0})}
-                  required
-                />
-              </div>
-
-              <div className="form-group">
-                <label>Leverage (x)</label>
-                <input 
-                  type="number" 
-                  step="1"
-                  min="1"
-                  max="125"
-                  value={formData.leverage} 
-                  onChange={(e) => setFormData({...formData, leverage: parseInt(e.target.value) || 1})}
-                  required
-                />
-              </div>
-
-              <div className="form-group">
-                <label>Max DCA Layers</label>
-                <input 
-                  type="number" 
-                  step="1"
-                  min="0"
-                  max="10"
-                  value={formData.maxDcaLayers ?? 3} 
-                  onChange={(e) => setFormData({...formData, maxDcaLayers: parseInt(e.target.value) || 0})}
-                  placeholder="e.g. 3 (0 to disable DCA)"
-                  required
-                />
-                <small>Maximum safety DCA replenishment layers per position side (0-10).</small>
-              </div>
-
-              <div className="form-group">
-                <label>Position Stop-Loss (%)</label>
-                <input 
-                  type="number" 
-                  step="0.1"
-                  min="0"
-                  max="50"
-                  value={formData.stopLossPercentage} 
-                  onChange={(e) => setFormData({...formData, stopLossPercentage: e.target.value === '' ? '' : parseFloat(e.target.value)})}
-                  placeholder="e.g. 5.0 (0 to disable)"
-                  required
-                />
-                <small>Closes losing leg if trend continues past max DCA layers (0 to disable).</small>
-              </div>
-
-              <div className="form-group checkbox-group" style={{ display: 'flex', alignItems: 'center', gap: '10px', marginTop: '20px', marginBottom: '20px' }}>
-                <input 
-                  type="checkbox" 
-                  id="tradingEnabled"
-                  checked={formData.tradingEnabled} 
-                  onChange={(e) => setFormData({...formData, tradingEnabled: e.target.checked})}
-                  style={{ width: '20px', height: '20px', cursor: 'pointer' }}
-                />
-                <label htmlFor="tradingEnabled" style={{ margin: 0, cursor: 'pointer', fontWeight: 'bold' }}>
-                  Trading Active (Global Killswitch)
-                </label>
-              </div>
-
-              <button type="submit" className="save-btn" disabled={saving}>
-                {saving ? 'Saving...' : 'Save Configuration'}
-              </button>
             </form>
           </div>
         </div>
@@ -334,4 +653,3 @@ function App() {
 }
 
 export default App;
-
