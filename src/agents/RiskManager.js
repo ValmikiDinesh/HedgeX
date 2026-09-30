@@ -90,12 +90,13 @@ class RiskManager {
       const contracts = Math.abs(parseFloat(pos.contracts ?? pos.info?.positionAmt ?? 0));
       if (!contracts || contracts <= 0) continue;
 
-      const posSideUpper = (pos.info?.positionSide || (pos.side ? pos.side.toUpperCase() : 'LONG')).toUpperCase();
-      const isLong = posSideUpper === 'LONG';
+      const posAmt = parseFloat(pos.info?.positionAmt ?? pos.contracts ?? 0);
+      const rawSide = (pos.info?.positionSide || (pos.side ? pos.side.toUpperCase() : '')).toUpperCase();
+      const isLong = rawSide === 'LONG' || (rawSide === 'BOTH' && posAmt > 0) || (pos.side === 'long') || (!rawSide && posAmt > 0);
       const sideToClose = isLong ? 'SELL' : 'BUY';
-      const positionSide = isLong ? 'LONG' : 'SHORT';
+      const positionSide = (rawSide === 'BOTH') ? 'BOTH' : (isLong ? 'LONG' : 'SHORT');
       
-      console.log(`🚨 Emergency Closing ${positionSide} position (${contracts} contracts)...`);
+      console.log(`🚨 Emergency Closing ${isLong ? 'LONG' : 'SHORT'} position (${contracts} contracts)...`);
       try {
         const closeOrder = await binanceService.placeHedgeOrder(
           symbol, 
@@ -127,7 +128,7 @@ class RiskManager {
         if (entryPrice > 0 && contracts > 0) {
           const historyRecord = new TradeHistory({
             symbol: symbol,
-            side: positionSide,
+            side: isLong ? 'LONG' : 'SHORT',
             entryPrice: entryPrice,
             exitPrice: currentPrice,
             quantity: contracts,
@@ -138,9 +139,9 @@ class RiskManager {
           await historyRecord.save();
         }
         
-        console.log(`✅ Emergency closed ${positionSide} successfully.`);
+        console.log(`✅ Emergency closed ${isLong ? 'LONG' : 'SHORT'} successfully.`);
       } catch (err) {
-        console.error(`❌ Failed to emergency close ${positionSide}:`, err.message);
+        console.error(`❌ Failed to emergency close ${isLong ? 'LONG' : 'SHORT'}:`, err.message);
       }
     }
     

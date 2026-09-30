@@ -131,11 +131,20 @@ app.get('/api/grid', async (req, res) => {
       const rawNetPnl = grossPnl - fees;
       const netPnl = Math.abs(rawNetPnl) < 0.00001 ? 0 : rawNetPnl;
       
+      const isLongPos = (pos.info?.positionSide === 'LONG') || (pos.side === 'long') || (pos.info?.positionSide === 'BOTH' && parseFloat(pos.info?.positionAmt || 0) > 0);
+      const computedTp = isLongPos 
+        ? entryPrice * (1 + (settings.gridPercentage || 0.015))
+        : entryPrice * (1 - (settings.gridPercentage || 0.015));
+      const stopLossPct = settings.stopLossPercentage ?? 0.05;
+      const computedSl = stopLossPct > 0 
+        ? (isLongPos ? entryPrice * (1 - stopLossPct) : entryPrice * (1 + stopLossPct))
+        : null;
+
       return {
         contracts: qty,
         entryPrice: entryPrice,
-        takeProfitPrice: legDb?.takeProfitPrice || null,
-        stopLossPrice: legDb?.stopLossPrice || null,
+        takeProfitPrice: legDb?.takeProfitPrice || (entryPrice > 0 ? computedTp : null),
+        stopLossPrice: legDb?.stopLossPrice || (entryPrice > 0 ? computedSl : null),
         dcaCount: legDb?.dcaCount || 0,
         lastDcaPrice: legDb?.lastDcaPrice || null,
         grossPnl: isFinite(grossPnl) ? grossPnl.toFixed(4) : "0.0000",
@@ -402,11 +411,18 @@ async function startBot() {
 // Graceful Shutdown
 const handleShutdown = async (signal) => {
   console.log(`\n🛑 Received ${signal}. Shutting down gracefully...`);
+  const forceExitTimeout = setTimeout(() => {
+    console.warn('⚠️ Force exiting after graceful shutdown timeout');
+    process.exit(0);
+  }, 3000);
+  forceExitTimeout.unref();
+
   try {
     marketAgent.stopWatching();
     await mongoose.connection.close();
     server.close(() => {
       console.log('✅ Server stopped cleanly.');
+      clearTimeout(forceExitTimeout);
       process.exit(0);
     });
   } catch (err) {

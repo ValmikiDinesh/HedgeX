@@ -65,6 +65,12 @@ class BinanceService {
     if (!this.exchange.markets || Object.keys(this.exchange.markets).length === 0) {
       try {
         await this.exchange.loadMarkets();
+        if (this.proExchange && (!this.proExchange.markets || Object.keys(this.proExchange.markets).length === 0)) {
+          this.proExchange.markets = this.exchange.markets;
+          this.proExchange.markets_by_id = this.exchange.markets_by_id;
+          this.proExchange.symbols = this.exchange.symbols;
+          this.proExchange.ids = this.exchange.ids;
+        }
       } catch (loadErr) {
         console.warn(`⚠️ Lazy loadMarkets warning:`, loadErr.message);
       }
@@ -268,7 +274,11 @@ class BinanceService {
   async cancelOrdersBySide(symbol, positionSide) {
     try {
       const openOrders = await this.fetchOpenOrders(symbol);
-      const matchingOrders = openOrders.filter(o => o.info && o.info.positionSide === positionSide);
+      const matchingOrders = openOrders.filter(o => {
+        if (!o.info) return false;
+        if (positionSide === 'BOTH') return true;
+        return o.info.positionSide === positionSide;
+      });
       if (matchingOrders.length === 0) return;
 
       const unifiedSymbol = this.toUnifiedSymbol(symbol);

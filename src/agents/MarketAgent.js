@@ -8,6 +8,7 @@ class MarketAgent extends EventEmitter {
     this.lastPriceTimestamp = 0;
     this.isWatching = false;
     this.currentSymbol = null;
+    this._livePriceSymbol = null;
     this._loopRunning = false;
     this._heartbeatInterval = null;
   }
@@ -19,6 +20,7 @@ class MarketAgent extends EventEmitter {
     
     if (this.currentSymbol !== targetSymbol) {
       this.livePrice = null;
+      this._livePriceSymbol = null;
     }
     this.currentSymbol = targetSymbol;
     this.isWatching = true;
@@ -53,16 +55,40 @@ class MarketAgent extends EventEmitter {
           while (this.isWatching && this.currentSymbol) {
             const activeSymbol = this.currentSymbol;
             try {
-              const trades = await binanceService.proExchange.watchTrades(activeSymbol);
+              let cancelTimer;
+              const timeoutPromise = new Promise(resolve => {
+                cancelTimer = setTimeout(() => resolve(null), 5000);
+              });
+              
+              const tickPromise = (binanceService.proExchange && binanceService.proExchange.has && binanceService.proExchange.has['watchTicker'])
+                ? binanceService.proExchange.watchTicker(activeSymbol)
+                : binanceService.proExchange.watchTrades(activeSymbol);
+
+              const result = await Promise.race([
+                tickPromise.catch(() => null),
+                timeoutPromise
+              ]);
+              clearTimeout(cancelTimer);
+
               if (this.currentSymbol !== activeSymbol) continue; // Drop stale tick if symbol changed
-              if (!trades || trades.length === 0) continue;
-              this.livePrice = trades[trades.length - 1].price;
-              this.lastPriceTimestamp = Date.now();
-              this.emit('price_tick', this.livePrice);
+              if (!result) continue;
+
+              let price = 0;
+              if (Array.isArray(result) && result.length > 0) {
+                price = parseFloat(result[result.length - 1].price);
+              } else if (result && typeof result === 'object') {
+                price = parseFloat(result.last || result.close || result.info?.lastPrice || result.info?.c || 0);
+              }
+
+              if (price && price > 0 && isFinite(price)) {
+                this.livePrice = price;
+                this._livePriceSymbol = activeSymbol;
+                this.lastPriceTimestamp = Date.now();
+                this.emit('price_tick', this.livePrice);
+              }
             } catch (err) {
               if (this.currentSymbol === activeSymbol) {
-                // If CCXT pro fails, wait 5s before retrying
-                await new Promise(res => setTimeout(res, 5000));
+                await new Promise(res => setTimeout(res, 3000));
               }
             }
           }
@@ -76,6 +102,7 @@ class MarketAgent extends EventEmitter {
   stopWatching() {
     this.isWatching = false;
     this.currentSymbol = null;
+    this._livePriceSymbol = null;
     if (this._heartbeatInterval) {
       clearInterval(this._heartbeatInterval);
       this._heartbeatInterval = null;
@@ -92,8 +119,8 @@ class MarketAgent extends EventEmitter {
     }
     
     const now = Date.now();
-    // Return cached price ONLY if fresh (less than 15 seconds old)
-    if (this.livePrice !== null && (now - this.lastPriceTimestamp < 15000)) {
+    // Return cached price ONLY if fresh (less than 15 seconds old) and symbol matches
+    if (this.livePrice !== null && (this._livePriceSymbol === unifiedSymbol || this._livePriceSymbol === rawSymbol) && (now - this.lastPriceTimestamp < 15000)) {
       return this.livePrice;
     }
     
@@ -104,11 +131,15 @@ class MarketAgent extends EventEmitter {
         ? unifiedSymbol 
         : (binanceService.exchange.markets[rawSymbol] ? rawSymbol : unifiedSymbol);
       const ticker = await binanceService.exchange.fetchTicker(targetSymbol);
-      if (ticker && ticker.last) {
-        this.livePrice = ticker.last;
-        this.lastPriceTimestamp = now;
-        this.emit('price_tick', this.livePrice);
-        return ticker.last;
+      if (ticker && (ticker.last || ticker.close)) {
+        const lastPrice = parseFloat(ticker.last || ticker.close);
+        if (lastPrice && lastPrice > 0 && isFinite(lastPrice)) {
+          this.livePrice = lastPrice;
+          this._livePriceSymbol = unifiedSymbol;
+          this.lastPriceTimestamp = now;
+          this.emit('price_tick', this.livePrice);
+          return lastPrice;
+        }
       }
       return this.livePrice;
     } catch (err) {
@@ -133,27 +164,38 @@ class MarketAgent extends EventEmitter {
         ? unifiedSymbol 
         : (binanceService.exchange.markets[rawSymbol] ? rawSymbol : unifiedSymbol);
       
-      const ohlcv = await binanceService.exchange.fetchOHLCV(targetSymbol, timeframe, undefined, period + 5);
+      let ohlcv;
+      try {
+        ohlcv = await binanceService.exchange.fetchOHLCV(targetSymbol, timeframe, undefined, period + 5);
+      } catch (fetchErr) {
+        if (targetSymbol !== unifiedSymbol) {
+          ohlcv = await binanceService.exchange.fetchOHLCV(unifiedSymbol, timeframe, undefined, period + 5);
+        } else {
+          throw fetchErr;
+        }
+      }
       if (!Array.isArray(ohlcv) || ohlcv.length <= period) return null;
 
       let trValues = [];
       for (let i = 1; i < ohlcv.length; i++) {
-        const high = ohlcv[i][2];
-        const low = ohlcv[i][3];
-        const prevClose = ohlcv[i - 1][4];
-        if (high === undefined || low === undefined || prevClose === undefined) continue;
+        const high = parseFloat(ohlcv[i][2]);
+        const low = parseFloat(ohlcv[i][3]);
+        const prevClose = parseFloat(ohlcv[i - 1][4]);
+        if (isNaN(high) || isNaN(low) || isNaN(prevClose)) continue;
         
         const tr = Math.max(
           high - low,
           Math.abs(high - prevClose),
           Math.abs(low - prevClose)
         );
-        trValues.push(tr);
+        if (isFinite(tr)) trValues.push(tr);
       }
 
       if (trValues.length < period) return null;
 
-      const atr = trValues.slice(-period).reduce((a, b) => a + b, 0) / period;
+      const sum = trValues.slice(-period).reduce((a, b) => a + b, 0);
+      const atr = sum / period;
+      if (!isFinite(atr) || atr <= 0) return null;
 
       this._cachedATR = atr;
       this._atrSymbol = rawSymbol;

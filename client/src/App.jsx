@@ -60,6 +60,14 @@ function App() {
   const [saving, setSaving] = useState(false);
   const currentSymbolRef = useRef(settings.symbol);
   const flashTimerRef = useRef(null);
+  const saveTimerRef = useRef(null);
+
+  useEffect(() => {
+    return () => {
+      if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
+      if (flashTimerRef.current) clearTimeout(flashTimerRef.current);
+    };
+  }, []);
 
   useEffect(() => {
     currentSymbolRef.current = settings.symbol;
@@ -191,6 +199,30 @@ function App() {
       cleanSym += 'USDT';
     }
 
+    const gridP = parseFloat(formData.gridPercentage);
+    if (isNaN(gridP) || gridP < 0.1 || gridP > 50) {
+      setSaveError('Grid profit target must be between 0.1% and 50%');
+      setSaving(false);
+      return;
+    }
+
+    const posP = parseFloat(formData.positionPercentage);
+    if (isNaN(posP) || posP < 1 || posP > 50) {
+      setSaveError('Position capital must be between 1% and 50%');
+      setSaving(false);
+      return;
+    }
+
+    if (formData.useDynamicGrid) {
+      const minG = parseFloat(formData.minGridPercentage) || 0;
+      const maxG = parseFloat(formData.maxGridPercentage) || 0;
+      if (minG >= maxG) {
+        setSaveError('Minimum grid spacing must be strictly less than maximum grid spacing');
+        setSaving(false);
+        return;
+      }
+    }
+
     try {
       const parsedStopLoss = parseFloat(formData.stopLossPercentage);
       const payload = {
@@ -211,7 +243,8 @@ function App() {
         setSettings(res.data);
       }
       setSaveSuccess(true);
-      setTimeout(() => {
+      if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
+      saveTimerRef.current = setTimeout(() => {
         setShowSettings(false);
         setSaveSuccess(false);
       }, 600);

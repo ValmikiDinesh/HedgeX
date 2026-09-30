@@ -350,6 +350,10 @@ class GridStrategyAgent {
             dbRecord.longLeg.entryPrice = entryPrice;
             dbRecord.longLeg.quantity = qty;
             dbRecord.longLeg.takeProfitPrice = tpPriceRaw;
+            const stopLossPercent = this.settings?.stopLossPercentage ?? 0.05;
+            if (!dbRecord.longLeg.stopLossPrice && stopLossPercent > 0 && entryPrice > 0) {
+              dbRecord.longLeg.stopLossPrice = entryPrice * (1 - stopLossPercent);
+            }
             dbRecord.longLeg.unrealizedPnl = 0;
             await dbRecord.save();
           } catch (healErr) {
@@ -404,6 +408,10 @@ class GridStrategyAgent {
             dbRecord.shortLeg.entryPrice = entryPrice;
             dbRecord.shortLeg.quantity = qty;
             dbRecord.shortLeg.takeProfitPrice = tpPriceRaw;
+            const stopLossPercent = this.settings?.stopLossPercentage ?? 0.05;
+            if (!dbRecord.shortLeg.stopLossPrice && stopLossPercent > 0 && entryPrice > 0) {
+              dbRecord.shortLeg.stopLossPrice = entryPrice * (1 + stopLossPercent);
+            }
             dbRecord.shortLeg.unrealizedPnl = 0;
             await dbRecord.save();
           } catch (healErr) {
@@ -510,6 +518,8 @@ class GridStrategyAgent {
              console.error(`⚠️ Failed to set LONG TP on reload fill:`, tpErr.message);
            }
            dbRecord.longLeg.takeProfitPrice = tpPriceRaw;
+           const stopLossPercent = this.settings?.stopLossPercentage ?? 0.05;
+           dbRecord.longLeg.stopLossPrice = (stopLossPercent > 0 && entryPrice > 0) ? entryPrice * (1 - stopLossPercent) : null;
            this.lastAppliedLongGrid = effectiveGridPercent;
            await dbRecord.save();
         } else {
@@ -569,7 +579,7 @@ class GridStrategyAgent {
         const stopLossPercent = this.settings.stopLossPercentage ?? 0.05;
         const currentLongDca = dbRecord.longLeg.dcaCount || 0;
         let longSlTriggered = false;
-        const longEntry = dbRecord.longLeg.entryPrice;
+        const longEntry = dbRecord.longLeg.entryPrice || parseFloat(longPos.info?.entryPrice || longPos.entryPrice || 0);
         const isLongSlBreached = stopLossPercent > 0 && longEntry > 0 && currentPrice <= longEntry * (1 - stopLossPercent);
 
         if (stopLossPercent > 0 && isLongSlBreached) {
@@ -625,7 +635,8 @@ class GridStrategyAgent {
               const verifyLong = verifyPositions.find(p => (p.info?.positionSide === 'LONG') || (p.side === 'long'));
               if (verifyLong && Math.abs(parseFloat(verifyLong.contracts ?? verifyLong.info?.positionAmt ?? 0)) > 0) {
                 const freeMargin = await binanceService.getBalance();
-                const requiredMargin = (quantityRaw * currentPrice) / leverage;
+                const safeLeverage = (leverage && leverage > 0) ? leverage : 1;
+                const requiredMargin = (quantityRaw * currentPrice) / safeLeverage;
                 if (freeMargin < requiredMargin * 1.05) {
                   console.warn(`⚠️ DCA LONG skipped: Free margin ($${freeMargin.toFixed(2)}) is below required margin ($${requiredMargin.toFixed(2)}).`);
                 } else {
@@ -738,6 +749,8 @@ class GridStrategyAgent {
              console.error(`⚠️ Failed to set SHORT TP on reload fill:`, tpErr.message);
            }
            dbRecord.shortLeg.takeProfitPrice = tpPriceRaw;
+           const stopLossPercent = this.settings?.stopLossPercentage ?? 0.05;
+           dbRecord.shortLeg.stopLossPrice = (stopLossPercent > 0 && entryPrice > 0) ? entryPrice * (1 + stopLossPercent) : null;
            this.lastAppliedShortGrid = effectiveGridPercent;
            await dbRecord.save();
         } else {
@@ -797,7 +810,7 @@ class GridStrategyAgent {
         const stopLossPercent = this.settings.stopLossPercentage ?? 0.05;
         const currentShortDca = dbRecord.shortLeg.dcaCount || 0;
         let shortSlTriggered = false;
-        const shortEntry = dbRecord.shortLeg.entryPrice;
+        const shortEntry = dbRecord.shortLeg.entryPrice || parseFloat(shortPos.info?.entryPrice || shortPos.entryPrice || 0);
         const isShortSlBreached = stopLossPercent > 0 && shortEntry > 0 && currentPrice >= shortEntry * (1 + stopLossPercent);
 
         if (stopLossPercent > 0 && isShortSlBreached) {
@@ -853,7 +866,8 @@ class GridStrategyAgent {
               const verifyShort = verifyPositions.find(p => (p.info?.positionSide === 'SHORT') || (p.side === 'short'));
               if (verifyShort && Math.abs(parseFloat(verifyShort.contracts ?? verifyShort.info?.positionAmt ?? 0)) > 0) {
                 const freeMargin = await binanceService.getBalance();
-                const requiredMargin = (quantityRaw * currentPrice) / leverage;
+                const safeLeverage = (leverage && leverage > 0) ? leverage : 1;
+                const requiredMargin = (quantityRaw * currentPrice) / safeLeverage;
                 if (freeMargin < requiredMargin * 1.05) {
                   console.warn(`⚠️ DCA SHORT skipped: Free margin ($${freeMargin.toFixed(2)}) is below required margin ($${requiredMargin.toFixed(2)}).`);
                 } else {
