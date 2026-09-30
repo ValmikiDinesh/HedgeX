@@ -163,6 +163,8 @@ class GridStrategyAgent {
         const extraIds = activeRecords.slice(1).map(r => r._id);
         await HedgePosition.updateMany({ _id: { $in: extraIds } }, { $set: { status: 'closed' } });
       }
+      if (!dbRecord.longLeg) dbRecord.longLeg = {};
+      if (!dbRecord.shortLeg) dbRecord.shortLeg = {};
 
       // 6. Dust Sweeper: safely drop ghost dust positions (< $5.00 min notional)
       const now = Date.now();
@@ -469,15 +471,48 @@ class GridStrategyAgent {
            const lastGrid = (this.lastAppliedLongGrid && this.lastAppliedLongGrid > 0) ? this.lastAppliedLongGrid : effectiveGridPercent;
            const gridShift = lastGrid > 0 ? Math.abs(effectiveGridPercent - lastGrid) / lastGrid : 0;
            const threshold = (this.settings.useDynamicGrid !== false) ? 0.15 : 0.0001;
-           const deviation = (this.settings.useDynamicGrid !== false) ? gridShift : Math.abs(dbRecord.longLeg.takeProfitPrice - expectedTp) / expectedTp;
-           if (deviation > threshold && expectedTp > 0) {
-              dbRecord.longLeg.takeProfitPrice = expectedTp;
+           const deviation = (this.settings.useDynamicGrid !== false) ? gridShift : Math.abs(dbRecord.longLeg.takeProfitPrice - expectedTp) / (expectedTp || 1);
+           if (currentPrice >= expectedTp && expectedTp > 0) {
+             console.log(`🎯 LONG Take-Profit target already reached during dynamic shift ($${currentPrice} >= $${expectedTp.toFixed(5)})! Locking in profit...`);
+             try {
+               await binanceService.cancelOrdersBySide(symbol, 'LONG');
+               const qty = Math.abs(parseFloat(longPos.contracts ?? longPos.info?.positionAmt ?? 0));
+               const closeOrder = await binanceService.placeHedgeOrder(symbol, 'SELL', 'LONG', qty, 'MARKET');
+               const exitPrice = parseFloat(closeOrder?.average || closeOrder?.price || currentPrice);
+               const entryPrice = parseFloat(longPos.info?.entryPrice || longPos.entryPrice || 0);
+               const grossPnl = (exitPrice - entryPrice) * qty;
+               const fees = (entryPrice * qty * 0.0005) + (exitPrice * qty * 0.0005);
+               const netPnl = grossPnl - fees;
+
+               const historyRecord = new TradeHistory({
+                 symbol: symbol,
+                 side: 'LONG',
+                 entryPrice: entryPrice,
+                 exitPrice: exitPrice,
+                 quantity: qty,
+                 grossPnl: isFinite(grossPnl) ? grossPnl : 0,
+                 fees: isFinite(fees) ? fees : 0,
+                 netPnl: isFinite(netPnl) ? netPnl : 0
+               });
+               await historyRecord.save();
+               dbRecord.longLeg.status = 'closed';
+               dbRecord.longLeg.dcaCount = 0;
+               dbRecord.longLeg.lastDcaPrice = null;
+               dbRecord.totalRealizedPnl = (dbRecord.totalRealizedPnl || 0) + netPnl;
+               await dbRecord.save();
+               longPos = null;
+             } catch (closeErr) {
+               console.error(`❌ Failed to market close in-profit LONG:`, closeErr.message);
+             }
+           } else if (deviation > threshold && expectedTp > 0) {
+              const tpPriceRaw = Math.max(expectedTp, currentPrice * 1.0005);
+              dbRecord.longLeg.takeProfitPrice = tpPriceRaw;
               this.lastAppliedLongGrid = effectiveGridPercent;
               await binanceService.cancelOrdersBySide(symbol, 'LONG');
               const qty = Math.abs(parseFloat(longPos.contracts ?? longPos.info?.positionAmt ?? 0));
               try {
-                await binanceService.placeHedgeOrder(symbol, 'SELL', 'LONG', qty, 'LIMIT', expectedTp);
-                console.log(`✅ LONG Take-Profit updated to $${expectedTp.toFixed(5)}`);
+                await binanceService.placeHedgeOrder(symbol, 'SELL', 'LONG', qty, 'LIMIT', tpPriceRaw);
+                console.log(`✅ LONG Take-Profit updated to $${tpPriceRaw.toFixed(5)}`);
               } catch (tpErr) {
                 console.warn(`⚠️ Failed to update LONG TP:`, tpErr.message);
               }
@@ -661,15 +696,48 @@ class GridStrategyAgent {
            const lastGridShort = (this.lastAppliedShortGrid && this.lastAppliedShortGrid > 0) ? this.lastAppliedShortGrid : effectiveGridPercent;
            const gridShiftShort = lastGridShort > 0 ? Math.abs(effectiveGridPercent - lastGridShort) / lastGridShort : 0;
            const threshold = (this.settings.useDynamicGrid !== false) ? 0.15 : 0.0001;
-           const deviation = (this.settings.useDynamicGrid !== false) ? gridShiftShort : Math.abs(dbRecord.shortLeg.takeProfitPrice - expectedTp) / expectedTp;
-           if (deviation > threshold && expectedTp > 0) {
-              dbRecord.shortLeg.takeProfitPrice = expectedTp;
+           const deviation = (this.settings.useDynamicGrid !== false) ? gridShiftShort : Math.abs(dbRecord.shortLeg.takeProfitPrice - expectedTp) / (expectedTp || 1);
+           if (currentPrice <= expectedTp && expectedTp > 0) {
+             console.log(`🎯 SHORT Take-Profit target already reached during dynamic shift ($${currentPrice} <= $${expectedTp.toFixed(5)})! Locking in profit...`);
+             try {
+               await binanceService.cancelOrdersBySide(symbol, 'SHORT');
+               const qty = Math.abs(parseFloat(shortPos.contracts ?? shortPos.info?.positionAmt ?? 0));
+               const closeOrder = await binanceService.placeHedgeOrder(symbol, 'BUY', 'SHORT', qty, 'MARKET');
+               const exitPrice = parseFloat(closeOrder?.average || closeOrder?.price || currentPrice);
+               const entryPrice = parseFloat(shortPos.info?.entryPrice || shortPos.entryPrice || 0);
+               const grossPnl = (entryPrice - exitPrice) * qty;
+               const fees = (entryPrice * qty * 0.0005) + (exitPrice * qty * 0.0005);
+               const netPnl = grossPnl - fees;
+
+               const historyRecord = new TradeHistory({
+                 symbol: symbol,
+                 side: 'SHORT',
+                 entryPrice: entryPrice,
+                 exitPrice: exitPrice,
+                 quantity: qty,
+                 grossPnl: isFinite(grossPnl) ? grossPnl : 0,
+                 fees: isFinite(fees) ? fees : 0,
+                 netPnl: isFinite(netPnl) ? netPnl : 0
+               });
+               await historyRecord.save();
+               dbRecord.shortLeg.status = 'closed';
+               dbRecord.shortLeg.dcaCount = 0;
+               dbRecord.shortLeg.lastDcaPrice = null;
+               dbRecord.totalRealizedPnl = (dbRecord.totalRealizedPnl || 0) + netPnl;
+               await dbRecord.save();
+               shortPos = null;
+             } catch (closeErr) {
+               console.error(`❌ Failed to market close in-profit SHORT:`, closeErr.message);
+             }
+           } else if (deviation > threshold && expectedTp > 0) {
+              const tpPriceRaw = Math.min(expectedTp, currentPrice * 0.9995);
+              dbRecord.shortLeg.takeProfitPrice = tpPriceRaw;
               this.lastAppliedShortGrid = effectiveGridPercent;
               await binanceService.cancelOrdersBySide(symbol, 'SHORT');
               const qty = Math.abs(parseFloat(shortPos.contracts ?? shortPos.info?.positionAmt ?? 0));
               try {
-                await binanceService.placeHedgeOrder(symbol, 'BUY', 'SHORT', qty, 'LIMIT', expectedTp);
-                console.log(`✅ SHORT Take-Profit updated to $${expectedTp.toFixed(5)}`);
+                await binanceService.placeHedgeOrder(symbol, 'BUY', 'SHORT', qty, 'LIMIT', tpPriceRaw);
+                console.log(`✅ SHORT Take-Profit updated to $${tpPriceRaw.toFixed(5)}`);
               } catch (tpErr) {
                 console.warn(`⚠️ Failed to update SHORT TP:`, tpErr.message);
               }

@@ -22,15 +22,20 @@ class BinanceService {
     this._lastFetchPosError = 0;
     this._lastFetchOrdersError = 0;
     this._lastBalanceError = 0;
+    this._lastMarginLeverageError = 0;
   }
 
   toRawSymbol(symbol) {
     if (!symbol || typeof symbol !== 'string') return '';
-    return symbol
+    let raw = symbol
       .trim()
       .replace(/[/:]/g, '')
       .replace(/(USDT|BUSD|USDC)\1$/i, '$1')
       .toUpperCase();
+    if (raw && !raw.endsWith('USDT') && !raw.endsWith('BUSD') && !raw.endsWith('USDC')) {
+      raw = raw + 'USDT';
+    }
+    return raw;
   }
 
   toUnifiedSymbol(symbol) {
@@ -103,7 +108,7 @@ class BinanceService {
         : (this.exchange.markets[rawSymbol] ? rawSymbol : symbol);
 
       // Format dynamically using Binance's strict precision rules
-      const quantity = this.exchange.amountToPrecision(targetSymbol, quantityRaw);
+      let quantity = this.exchange.amountToPrecision(targetSymbol, quantityRaw);
       if (!quantity || parseFloat(quantity) <= 0) {
         throw new Error(`Invalid order quantity (${quantityRaw} rounded to ${quantity}) for ${targetSymbol}`);
       }
@@ -111,6 +116,22 @@ class BinanceService {
       const market = this.exchange.markets ? this.exchange.markets[targetSymbol] : null;
       if (market?.limits?.amount?.min && parseFloat(quantity) < market.limits.amount.min) {
         throw new Error(`Order quantity ${quantity} is below exchange minimum of ${market.limits.amount.min} for ${targetSymbol}`);
+      }
+
+      // Check minCost / minNotional filter (Binance USD-M requires at least 5.0 USDT notional value)
+      const minCost = market?.limits?.cost?.min || 5.0;
+      const refPrice = (priceRaw && parseFloat(priceRaw) > 0) 
+        ? parseFloat(priceRaw) 
+        : (market?.last || (market?.info?.lastPrice ? parseFloat(market.info.lastPrice) : 0));
+      if (refPrice > 0) {
+        const notional = parseFloat(quantity) * refPrice;
+        if (notional < minCost) {
+          const neededQtyRaw = (minCost * 1.02) / refPrice;
+          const adjustedQty = this.exchange.amountToPrecision(targetSymbol, neededQtyRaw);
+          if (parseFloat(adjustedQty) > parseFloat(quantity)) {
+            quantity = adjustedQty;
+          }
+        }
       }
       
       let order;
@@ -263,7 +284,11 @@ class BinanceService {
     } catch (err) {
       // Binance throws -4046 if already set to CROSSED, -4059 if positions are open
       if (!err.message || (!err.message.includes('-4046') && !err.message.includes('-4059'))) {
-        console.error(`❌ Failed to set CROSSED margin:`, err.message);
+        const now = Date.now();
+        if (now - this._lastMarginLeverageError > 60000) {
+          console.error(`❌ Failed to set CROSSED margin:`, err.message);
+          this._lastMarginLeverageError = now;
+        }
         throw err;
       }
     }
@@ -282,7 +307,11 @@ class BinanceService {
     } catch (err) {
       // Ignore if already set (-4028)
       if (!err.message || !err.message.includes('-4028')) {
-        console.error(`❌ Failed to set leverage to ${leverage}:`, err.message);
+        const now = Date.now();
+        if (now - this._lastMarginLeverageError > 60000) {
+          console.error(`❌ Failed to set leverage to ${leverage}:`, err.message);
+          this._lastMarginLeverageError = now;
+        }
         throw err;
       }
     }

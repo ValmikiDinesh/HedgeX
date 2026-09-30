@@ -171,11 +171,14 @@ function App() {
     setSaveError(null);
 
     // Client-side validation
-    const cleanSym = normalizeSymbol(formData.symbol);
-    if (!cleanSym || cleanSym.length < 3) {
+    let cleanSym = normalizeSymbol(formData.symbol);
+    if (!cleanSym || cleanSym.length < 2) {
       setSaveError('Please enter a valid coin pair symbol (e.g. DOGEUSDT)');
       setSaving(false);
       return;
+    }
+    if (!cleanSym.endsWith('USDT') && !cleanSym.endsWith('BUSD') && !cleanSym.endsWith('USDC')) {
+      cleanSym += 'USDT';
     }
 
     try {

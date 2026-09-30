@@ -36,6 +36,14 @@ const io = new Server(server, {
 app.use(cors());
 app.use(express.json());
 
+// Catch malformed JSON payloads gracefully
+app.use((err, req, res, next) => {
+  if (err instanceof SyntaxError && err.status === 400 && 'body' in err) {
+    return res.status(400).json({ error: 'Malformed JSON payload in request body' });
+  }
+  next(err);
+});
+
 // 1. Dashboard API Routes
 app.get('/api/status', async (req, res) => {
   try {
@@ -104,9 +112,10 @@ app.get('/api/grid', async (req, res) => {
 
     const calculateBreakdown = (pos, currentPrice, legDb) => {
       if (!pos) return null;
+      const qty = Math.abs(parseFloat(pos.contracts ?? pos.info?.positionAmt ?? 0));
+      if (qty <= 0) return null;
       const entryPrice = parseFloat(pos.info?.entryPrice || pos.entryPrice || 0);
       const safePrice = (currentPrice && currentPrice > 0) ? currentPrice : entryPrice;
-      const qty = Math.abs(parseFloat(pos.contracts ?? pos.info?.positionAmt ?? 0));
       const rawGrossPnl = parseFloat(pos.info?.unRealizedProfit || pos.unrealizedPnl || 0);
       const grossPnl = Math.abs(rawGrossPnl) < 0.00001 ? 0 : rawGrossPnl;
       
@@ -165,7 +174,10 @@ app.post('/api/settings', async (req, res) => {
     delete updates.singletonId;
 
     if (updates.symbol !== undefined) {
-      const sanitized = binanceService.toRawSymbol(updates.symbol);
+      let sanitized = binanceService.toRawSymbol(updates.symbol);
+      if (!sanitized.endsWith('USDT') && !sanitized.endsWith('BUSD') && !sanitized.endsWith('USDC')) {
+        sanitized += 'USDT';
+      }
       if (!sanitized || sanitized.length < 3 || sanitized.length > 20) {
         return res.status(400).json({ error: 'Invalid trading pair symbol' });
       }
@@ -273,7 +285,11 @@ app.post('/api/settings', async (req, res) => {
 
 app.get('/api/history', async (req, res) => {
   try {
-    const history = await TradeHistory.find().sort({ closedAt: -1 }).limit(50);
+    const filter = {};
+    if (req.query.symbol) {
+      filter.symbol = binanceService.toRawSymbol(req.query.symbol);
+    }
+    const history = await TradeHistory.find(filter).sort({ closedAt: -1 }).limit(50);
     res.json(Array.isArray(history) ? history : []);
   } catch (err) {
     res.status(500).json({ error: 'Failed to fetch trade history' });
@@ -304,6 +320,8 @@ async function startBot() {
   try {
     await mongoose.connect(process.env.MONGODB_URI);
     console.log('✅ Connected to MongoDB');
+    mongoose.connection.on('disconnected', () => console.warn('⚠️ MongoDB disconnected. Mongoose attempting reconnect...'));
+    mongoose.connection.on('reconnected', () => console.log('✅ MongoDB reconnected.'));
   } catch (mongoErr) {
     console.error('❌ MongoDB Connection Error:', mongoErr.message);
     console.log('🔄 Will retry MongoDB connection in 5s...');
