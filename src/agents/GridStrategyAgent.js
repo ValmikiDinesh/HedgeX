@@ -5,14 +5,14 @@ import HedgePosition from '../models/HedgePosition.js';
 import BotSettings from '../models/BotSettings.js';
 import TradeHistory from '../models/TradeHistory.js';
 
+const STOP_LOSS_COOLDOWN_MS = 5 * 60 * 1000; // 5-minute cooldown after stop-loss to avoid knife-catching
+
 class GridStrategyAgent {
   constructor() {
     this.isActive = false;
     this.currentSymbol = null; // Track internally to detect symbol changes
     this.currentLeverage = null; // Track internally to detect leverage changes
     this.settings = null;
-    // Round 6: Dynamic Grid tracking
-    // Round 6/7: Dynamic Grid & TP Tracking
     this.lastAppliedLongGrid = null;
     this.lastAppliedShortGrid = null;
   }
@@ -38,7 +38,7 @@ class GridStrategyAgent {
       const entryOrder = await binanceService.placeHedgeOrder(symbol, entrySide, side, quantityRaw, 'MARKET');
       const executionPrice = entryOrder.average || entryOrder.price || currentPrice;
       const filledQty = parseFloat(entryOrder.filled || entryOrder.amount || quantityRaw);
-      const tpPriceRaw = isLong 
+      let tpPriceRaw = isLong 
         ? Math.max(executionPrice * (1 + effectiveGridPercent), currentPrice * 1.0005)
         : Math.min(executionPrice * (1 - effectiveGridPercent), currentPrice * 0.9995);
 
@@ -53,6 +53,7 @@ class GridStrategyAgent {
             ? Math.max(executionPrice * (1 + effectiveGridPercent), (freshPrice || currentPrice) * 1.001)
             : Math.min(executionPrice * (1 - effectiveGridPercent), (freshPrice || currentPrice) * 0.999);
           await binanceService.placeHedgeOrder(symbol, tpSide, side, filledQty, 'LIMIT', bufferedTp);
+          tpPriceRaw = bufferedTp;
           console.log(`✅ ${side} Take-Profit successfully set on retry at ${bufferedTp.toFixed(5)}`);
         } catch (retryErr) {
           console.warn(`⚠️ ${side} initial Take-Profit placement deferred to Self-Healing:`, retryErr.message);
@@ -67,7 +68,8 @@ class GridStrategyAgent {
         takeProfitPrice: tpPriceRaw,
         dcaCount: 0,
         lastDcaPrice: null,
-        unrealizedPnl: 0
+        unrealizedPnl: 0,
+        stoppedOutAt: null
       };
       await dbRecord.save();
     } catch (err) {
@@ -82,15 +84,17 @@ class GridStrategyAgent {
     try {
       // 1. Fetch Dynamic Settings
       this.settings = await this.fetchSettings();
-      const { symbol, gridPercentage, positionPercentage, tradingEnabled } = this.settings;
+      const rawSymbol = binanceService.toRawSymbol(this.settings.symbol);
+      const symbol = rawSymbol;
+      const { gridPercentage, positionPercentage, tradingEnabled } = this.settings;
       let leverage = this.settings.leverage;
 
-      // 2. Coin Swap is handled dynamically by index.js and DB state. No need to duplicate here.
-      
       // Update tracking symbol & leverage independently
       const symbolChanged = this.currentSymbol !== symbol;
       if (symbolChanged) {
         this.currentSymbol = symbol;
+        this.lastAppliedLongGrid = null;
+        this.lastAppliedShortGrid = null;
       }
       
       if (this.currentLeverage !== leverage || symbolChanged) {
@@ -107,7 +111,7 @@ class GridStrategyAgent {
 
       // 3. Check Margin Safety
       const safetyStatus = await riskManager.checkMarginSafety(symbol);
-      if (safetyStatus === 'PANIC') {
+      if (safetyStatus === 'PANIC' || safetyStatus === 'PAUSE') {
         this.isActive = false;
         return;
       }
@@ -115,11 +119,11 @@ class GridStrategyAgent {
 
       // 4. Fetch current active positions and orders
       const positions = await binanceService.fetchOpenPositions(symbol);
-      let longPos = positions.find(p => p.info.positionSide === 'LONG');
-      let shortPos = positions.find(p => p.info.positionSide === 'SHORT');
+      let longPos = positions.find(p => (p.info?.positionSide === 'LONG') || (p.side === 'long'));
+      let shortPos = positions.find(p => (p.info?.positionSide === 'SHORT') || (p.side === 'short'));
       
       const currentPrice = await marketAgent.getCurrentPrice(symbol);
-      if (!currentPrice) {
+      if (!currentPrice || currentPrice <= 0) {
         this.isActive = false;
         return;
       }
@@ -139,50 +143,46 @@ class GridStrategyAgent {
         }
       }
 
-      // Fetch or Create DB Record
-      let dbRecord = await HedgePosition.findOne({ symbol: symbol, status: 'active' });
+      // Fetch or Create DB Record (always sort by createdAt desc for consistency)
+      let dbRecord = await HedgePosition.findOne({ symbol: symbol, status: 'active' }).sort({ createdAt: -1 });
       if (!dbRecord) {
         dbRecord = new HedgePosition({ symbol: symbol });
         await dbRecord.save();
       }
 
-      // --- DUST SWEEPER (Phase 9) ---
-      // Eliminate partial-fill dust ghosts that paralyze the grid with MIN_NOTIONAL spam
-      if (longPos && (Math.abs(parseFloat(longPos.contracts)) * currentPrice) < 5.0) {
-         console.warn(`🧹 Detected LONG Dust Position ($${(Math.abs(parseFloat(longPos.contracts)) * currentPrice).toFixed(2)} < $5.00 min notional)...`);
-         try {
-             await binanceService.placeHedgeOrder(symbol, 'SELL', 'LONG', Math.abs(parseFloat(longPos.contracts)), 'MARKET');
-         } catch(e) {
-             console.warn(`⚠️ Dust position below exchange min notional. Dropping ghost contracts from memory to prevent grid stall.`);
-         }
-         // Safely reset DB record so it does NOT trigger a phantom trade log in Section 5
-         if (dbRecord.longLeg) {
-           dbRecord.longLeg.status = 'closed';
-           dbRecord.longLeg.dcaCount = 0;
-           dbRecord.longLeg.lastDcaPrice = null;
-           await dbRecord.save();
-         }
-         longPos = null; // ALWAYS clear from memory so healthy position can open!
+      // --- DUST SWEEPER ---
+      // Safely drop ghost dust positions (< $5.00 min notional) without spamming failing market orders
+      if (longPos) {
+        const longNotional = Math.abs(parseFloat(longPos.contracts)) * currentPrice;
+        if (longNotional < 5.0) {
+          console.warn(`🧹 Detected LONG Dust Position ($${longNotional.toFixed(2)} < $5.00 min notional). Dropping ghost contracts from memory.`);
+          await binanceService.cancelOrdersBySide(symbol, 'LONG').catch(() => {});
+          if (dbRecord.longLeg) {
+            dbRecord.longLeg.status = 'closed';
+            dbRecord.longLeg.dcaCount = 0;
+            dbRecord.longLeg.lastDcaPrice = null;
+            await dbRecord.save();
+          }
+          longPos = null;
+        }
       }
       
-      if (shortPos && (Math.abs(parseFloat(shortPos.contracts)) * currentPrice) < 5.0) {
-         console.warn(`🧹 Detected SHORT Dust Position ($${(Math.abs(parseFloat(shortPos.contracts)) * currentPrice).toFixed(2)} < $5.00 min notional)...`);
-         try {
-             await binanceService.placeHedgeOrder(symbol, 'BUY', 'SHORT', Math.abs(parseFloat(shortPos.contracts)), 'MARKET');
-         } catch(e) { 
-             console.warn(`⚠️ Dust position below exchange min notional. Dropping ghost contracts from memory to prevent grid stall.`);
-         }
-         // Safely reset DB record so it does NOT trigger a phantom trade log in Section 6
-         if (dbRecord.shortLeg) {
-           dbRecord.shortLeg.status = 'closed';
-           dbRecord.shortLeg.dcaCount = 0;
-           dbRecord.shortLeg.lastDcaPrice = null;
-           await dbRecord.save();
-         }
-         shortPos = null; // ALWAYS clear from memory so healthy position can open!
+      if (shortPos) {
+        const shortNotional = Math.abs(parseFloat(shortPos.contracts)) * currentPrice;
+        if (shortNotional < 5.0) {
+          console.warn(`🧹 Detected SHORT Dust Position ($${shortNotional.toFixed(2)} < $5.00 min notional). Dropping ghost contracts from memory.`);
+          await binanceService.cancelOrdersBySide(symbol, 'SHORT').catch(() => {});
+          if (dbRecord.shortLeg) {
+            dbRecord.shortLeg.status = 'closed';
+            dbRecord.shortLeg.dcaCount = 0;
+            dbRecord.shortLeg.lastDcaPrice = null;
+            await dbRecord.save();
+          }
+          shortPos = null;
+        }
       }
       
-      // Calculate Notional Size symmetrically based on TOTAL wallet balance (including locked margin)
+      // Calculate Notional Size symmetrically based on TOTAL wallet balance
       const balance = await binanceService.getTotalWalletBalance();
       const notionalSize = (balance * positionPercentage) * leverage;
       const quantityRaw = notionalSize / currentPrice;
@@ -190,15 +190,16 @@ class GridStrategyAgent {
       // Binance requires $5.00 min notional. Pad it safely.
       const minNotional = 5.0 / Math.max(0.1, (1 - effectiveGridPercent));
       const canOpenNewPosition = notionalSize >= minNotional && quantityRaw > 0 && balance > 0 && !isMarginWarning;
-      if (!canOpenNewPosition) {
+      if (!canOpenNewPosition && tradingEnabled) {
         console.warn(`⚠️ Cannot open new positions: Notional size ($${notionalSize.toFixed(2)}) is below padded Binance minimum of $${minNotional.toFixed(2)} or balance is too low.`);
       }
 
-      // Helper function to calculate Net PnL (Deducting 0.07% round-trip exchange fees)
+      // Helper function to calculate Net PnL (Deducting ~0.07% round-trip exchange fees)
       const calculateNetPnl = (unRealizedPnlStr, entryPrice, qty) => {
         const grossPnl = parseFloat(unRealizedPnlStr || 0);
-        // Estimate Maker (0.02%) + Taker (0.05%) = 0.07% total fees on the notional size
-        const estimatedFees = (entryPrice * qty) * 0.0007; 
+        const safeEntry = isFinite(entryPrice) ? entryPrice : 0;
+        const safeQty = isFinite(qty) ? qty : 0;
+        const estimatedFees = (safeEntry * safeQty) * 0.0007; 
         return grossPnl - estimatedFees;
       };
 
@@ -211,22 +212,15 @@ class GridStrategyAgent {
           const nominalExit = oldLeg.takeProfitPrice;
           const qty = oldLeg.quantity;
           
-          if (!entry || !nominalExit || !qty || isNaN(entry) || isNaN(nominalExit) || isNaN(qty)) {
+          if (!entry || !qty || isNaN(entry) || isNaN(qty) || entry <= 0 || qty <= 0) {
             console.warn(`⚠️ Skipping TradeHistory log for ${side}: missing/invalid numeric values.`);
             oldLeg.status = 'closed';
             await dbRecord.save();
             return;
           }
 
-          // Verify whether exit occurred near TP or externally (e.g. manual close on exchange)
-          let exit = nominalExit;
-          const isLongTpNear = side === 'LONG' && currentPrice >= nominalExit * 0.995;
-          const isShortTpNear = side === 'SHORT' && currentPrice <= nominalExit * 1.005;
-
-          if (!isLongTpNear && !isShortTpNear) {
-            exit = currentPrice;
-            console.warn(`ℹ️ ${side} position closed externally (Current: $${currentPrice}, TP: $${nominalExit}). Logging realized exit at actual price.`);
-          }
+          // In hedge mode, when position closes naturally, limit TP order executed at nominalExit
+          const exit = (nominalExit && nominalExit > 0) ? nominalExit : currentPrice;
           
           let grossPnl = 0;
           if (side === 'LONG') {
@@ -238,7 +232,7 @@ class GridStrategyAgent {
           const fees = (entry * qty * 0.0005) + (exit * qty * 0.0002);
           const netPnl = grossPnl - fees;
           
-          console.log(`💰 ${side} Trade Closed! Realized Net PnL: $${netPnl.toFixed(4)} (Exit: $${exit})`);
+          console.log(`💰 ${side} Trade Closed! Realized Net PnL: $${netPnl.toFixed(4)} (Entry: $${entry}, Exit: $${exit})`);
           
           const historyRecord = new TradeHistory({
             symbol: symbol,
@@ -246,13 +240,12 @@ class GridStrategyAgent {
             entryPrice: entry,
             exitPrice: exit,
             quantity: qty,
-            grossPnl: grossPnl,
-            fees: fees,
-            netPnl: netPnl
+            grossPnl: isFinite(grossPnl) ? grossPnl : 0,
+            fees: isFinite(fees) ? fees : 0,
+            netPnl: isFinite(netPnl) ? netPnl : 0
           });
           await historyRecord.save();
           
-          // CRITICAL BUG FIX: Mutate state to prevent infinite double-logging
           oldLeg.status = 'closed';
           await dbRecord.save();
         } catch (err) {
@@ -262,47 +255,118 @@ class GridStrategyAgent {
       
       // 4.5 Self-Healing State Machine (Detect & Repair Orphaned Positions)
       const openOrders = await binanceService.fetchOpenOrders(symbol);
-      // STRICT FILTER: A LONG TP is a SELL order. A SHORT TP is a BUY order.
-      const longTpOrders = openOrders.filter(o => o.info.positionSide === 'LONG' && o.info.side === 'SELL' && (o.type && o.type.toLowerCase() === 'limit'));
-      const shortTpOrders = openOrders.filter(o => o.info.positionSide === 'SHORT' && o.info.side === 'BUY' && (o.type && o.type.toLowerCase() === 'limit'));
+      const longTpOrders = openOrders.filter(o => o.info && o.info.positionSide === 'LONG' && o.info.side === 'SELL' && (o.type && o.type.toLowerCase() === 'limit'));
+      const shortTpOrders = openOrders.filter(o => o.info && o.info.positionSide === 'SHORT' && o.info.side === 'BUY' && (o.type && o.type.toLowerCase() === 'limit'));
 
+      // LONG Self-Healing
       if (longPos && Math.abs(parseFloat(longPos.contracts)) > 0 && longTpOrders.length === 0) {
-        console.warn(`🚨 ORPHANED LONG POSITION DETECTED! Re-applying Take Profit...`);
-        try {
-          const entryPrice = parseFloat(longPos.info.entryPrice);
-          const tpPriceRaw = Math.max(entryPrice * (1 + effectiveGridPercent), currentPrice * 1.0005);
-          const qty = Math.abs(parseFloat(longPos.contracts));
-          const healOrder = await binanceService.placeHedgeOrder(symbol, 'SELL', 'LONG', qty, 'LIMIT', tpPriceRaw);
-          console.log(`✅ LONG Self-Healing Successful!`);
-          dbRecord.longLeg.exchangeOrderId = healOrder?.id || 'healed';
-          dbRecord.longLeg.status = 'open';
-          dbRecord.longLeg.entryPrice = entryPrice;
-          dbRecord.longLeg.quantity = qty;
-          dbRecord.longLeg.takeProfitPrice = tpPriceRaw;
-          dbRecord.longLeg.unrealizedPnl = 0;
-          await dbRecord.save();
-        } catch (healErr) {
-          console.error(`❌ Failed to heal LONG position:`, healErr.message);
+        const entryPrice = parseFloat(longPos.info?.entryPrice || longPos.entryPrice || 0);
+        const qty = Math.abs(parseFloat(longPos.contracts));
+        const targetTp = entryPrice * (1 + effectiveGridPercent);
+
+        // PROACTIVE PROFIT-TAKING: If price already reached/surpassed TP, market close immediately!
+        if (currentPrice >= targetTp && entryPrice > 0) {
+          console.log(`🎯 LONG Take-Profit target already met ($${currentPrice} >= $${targetTp.toFixed(5)})! Market closing to lock in profit...`);
+          try {
+            await binanceService.cancelOrdersBySide(symbol, 'LONG');
+            const closeOrder = await binanceService.placeHedgeOrder(symbol, 'SELL', 'LONG', qty, 'MARKET');
+            const exitPrice = closeOrder?.average || closeOrder?.price || currentPrice;
+            const grossPnl = (exitPrice - entryPrice) * qty;
+            const fees = (entryPrice * qty * 0.0005) + (exitPrice * qty * 0.0005);
+            const netPnl = grossPnl - fees;
+
+            const historyRecord = new TradeHistory({
+              symbol: symbol,
+              side: 'LONG',
+              entryPrice: entryPrice,
+              exitPrice: exitPrice,
+              quantity: qty,
+              grossPnl: isFinite(grossPnl) ? grossPnl : 0,
+              fees: isFinite(fees) ? fees : 0,
+              netPnl: isFinite(netPnl) ? netPnl : 0
+            });
+            await historyRecord.save();
+            dbRecord.longLeg.status = 'closed';
+            dbRecord.longLeg.dcaCount = 0;
+            dbRecord.longLeg.lastDcaPrice = null;
+            await dbRecord.save();
+            longPos = null;
+            console.log(`✅ LONG Profit locked via Market Close. Realized Net PnL: $${netPnl.toFixed(4)}`);
+          } catch (closeErr) {
+            console.error(`❌ Failed to market close in-profit LONG position:`, closeErr.message);
+          }
+        } else if (entryPrice > 0) {
+          console.warn(`🚨 ORPHANED LONG POSITION DETECTED! Re-applying Take Profit...`);
+          try {
+            const tpPriceRaw = Math.max(targetTp, currentPrice * 1.0005);
+            const healOrder = await binanceService.placeHedgeOrder(symbol, 'SELL', 'LONG', qty, 'LIMIT', tpPriceRaw);
+            console.log(`✅ LONG Self-Healing Successful!`);
+            dbRecord.longLeg.exchangeOrderId = healOrder?.id || 'healed';
+            dbRecord.longLeg.status = 'open';
+            dbRecord.longLeg.entryPrice = entryPrice;
+            dbRecord.longLeg.quantity = qty;
+            dbRecord.longLeg.takeProfitPrice = tpPriceRaw;
+            dbRecord.longLeg.unrealizedPnl = 0;
+            await dbRecord.save();
+          } catch (healErr) {
+            console.error(`❌ Failed to heal LONG position:`, healErr.message);
+          }
         }
       }
 
+      // SHORT Self-Healing
       if (shortPos && Math.abs(parseFloat(shortPos.contracts)) > 0 && shortTpOrders.length === 0) {
-        console.warn(`🚨 ORPHANED SHORT POSITION DETECTED! Re-applying Take Profit...`);
-        try {
-          const entryPrice = parseFloat(shortPos.info.entryPrice);
-          const tpPriceRaw = Math.min(entryPrice * (1 - effectiveGridPercent), currentPrice * 0.9995);
-          const qty = Math.abs(parseFloat(shortPos.contracts));
-          const healOrder = await binanceService.placeHedgeOrder(symbol, 'BUY', 'SHORT', qty, 'LIMIT', tpPriceRaw);
-          console.log(`✅ SHORT Self-Healing Successful!`);
-          dbRecord.shortLeg.exchangeOrderId = healOrder?.id || 'healed';
-          dbRecord.shortLeg.status = 'open';
-          dbRecord.shortLeg.entryPrice = entryPrice;
-          dbRecord.shortLeg.quantity = qty;
-          dbRecord.shortLeg.takeProfitPrice = tpPriceRaw;
-          dbRecord.shortLeg.unrealizedPnl = 0;
-          await dbRecord.save();
-        } catch (healErr) {
-          console.error(`❌ Failed to heal SHORT position:`, healErr.message);
+        const entryPrice = parseFloat(shortPos.info?.entryPrice || shortPos.entryPrice || 0);
+        const qty = Math.abs(parseFloat(shortPos.contracts));
+        const targetTp = entryPrice * (1 - effectiveGridPercent);
+
+        // PROACTIVE PROFIT-TAKING: If price already dropped below TP, market close immediately!
+        if (currentPrice <= targetTp && entryPrice > 0) {
+          console.log(`🎯 SHORT Take-Profit target already met ($${currentPrice} <= $${targetTp.toFixed(5)})! Market closing to lock in profit...`);
+          try {
+            await binanceService.cancelOrdersBySide(symbol, 'SHORT');
+            const closeOrder = await binanceService.placeHedgeOrder(symbol, 'BUY', 'SHORT', qty, 'MARKET');
+            const exitPrice = closeOrder?.average || closeOrder?.price || currentPrice;
+            const grossPnl = (entryPrice - exitPrice) * qty;
+            const fees = (entryPrice * qty * 0.0005) + (exitPrice * qty * 0.0005);
+            const netPnl = grossPnl - fees;
+
+            const historyRecord = new TradeHistory({
+              symbol: symbol,
+              side: 'SHORT',
+              entryPrice: entryPrice,
+              exitPrice: exitPrice,
+              quantity: qty,
+              grossPnl: isFinite(grossPnl) ? grossPnl : 0,
+              fees: isFinite(fees) ? fees : 0,
+              netPnl: isFinite(netPnl) ? netPnl : 0
+            });
+            await historyRecord.save();
+            dbRecord.shortLeg.status = 'closed';
+            dbRecord.shortLeg.dcaCount = 0;
+            dbRecord.shortLeg.lastDcaPrice = null;
+            await dbRecord.save();
+            shortPos = null;
+            console.log(`✅ SHORT Profit locked via Market Close. Realized Net PnL: $${netPnl.toFixed(4)}`);
+          } catch (closeErr) {
+            console.error(`❌ Failed to market close in-profit SHORT position:`, closeErr.message);
+          }
+        } else if (entryPrice > 0) {
+          console.warn(`🚨 ORPHANED SHORT POSITION DETECTED! Re-applying Take Profit...`);
+          try {
+            const tpPriceRaw = Math.min(targetTp, currentPrice * 0.9995);
+            const healOrder = await binanceService.placeHedgeOrder(symbol, 'BUY', 'SHORT', qty, 'LIMIT', tpPriceRaw);
+            console.log(`✅ SHORT Self-Healing Successful!`);
+            dbRecord.shortLeg.exchangeOrderId = healOrder?.id || 'healed';
+            dbRecord.shortLeg.status = 'open';
+            dbRecord.shortLeg.entryPrice = entryPrice;
+            dbRecord.shortLeg.quantity = qty;
+            dbRecord.shortLeg.takeProfitPrice = tpPriceRaw;
+            dbRecord.shortLeg.unrealizedPnl = 0;
+            await dbRecord.save();
+          } catch (healErr) {
+            console.error(`❌ Failed to heal SHORT position:`, healErr.message);
+          }
         }
       }
 
@@ -317,7 +381,14 @@ class GridStrategyAgent {
         }
         this.lastAppliedLongGrid = null; // Reset grid tracking
 
-        if (tradingEnabled && canOpenNewPosition) {
+        // Stop-Loss Cooldown Guard: Prevents immediate knife-catching re-entry
+        const longCooldownRemaining = dbRecord.longLeg?.stoppedOutAt 
+          ? Math.max(0, STOP_LOSS_COOLDOWN_MS - (Date.now() - new Date(dbRecord.longLeg.stoppedOutAt).getTime()))
+          : 0;
+
+        if (longCooldownRemaining > 0) {
+          console.log(`⏳ LONG leg is in Stop-Loss Cooldown (${Math.ceil(longCooldownRemaining / 1000)}s left). Holding off re-entry.`);
+        } else if (tradingEnabled && canOpenNewPosition) {
           const existingLongBuy = openOrders.find(o => o.info && o.info.positionSide === 'LONG' && o.info.side === 'BUY' && (o.type && o.type.toLowerCase() === 'limit'));
           const prevEntry = dbRecord.longLeg?.entryPrice;
 
@@ -328,13 +399,10 @@ class GridStrategyAgent {
               await binanceService.cancelOrdersBySide(symbol, 'LONG');
               await this.executeMarketEntry('LONG', symbol, quantityRaw, currentPrice, effectiveGridPercent, dbRecord);
             }
-            // Otherwise, patiently waiting for pullback to fill wholesale limit buy
           } else if (prevEntry && currentPrice >= prevEntry * (1 + effectiveGridPercent * 1.5)) {
-            // Direct Trend Breakout without first placing a stale resting limit miles below
             console.log(`🚀 LONG Trend Breakout! Advancing grid immediately to current price...`);
             await this.executeMarketEntry('LONG', symbol, quantityRaw, currentPrice, effectiveGridPercent, dbRecord);
           } else if (prevEntry && currentPrice > prevEntry) {
-            // Place Reload LIMIT Buy order back at wholesale base price
             console.log(`🎯 Setting LONG Reload Limit Buy at $${prevEntry.toFixed(5)} (Current: $${currentPrice.toFixed(5)})...`);
             try {
               await binanceService.cancelOrdersBySide(symbol, 'LONG');
@@ -355,13 +423,13 @@ class GridStrategyAgent {
           }
         }
       } else {
-        // ALWAYS self-heal entry price and quantity to exactly match the exchange! Eliminates precision/slippage drift.
-        dbRecord.longLeg.entryPrice = parseFloat(longPos.info.entryPrice);
+        // ALWAYS self-heal entry price and quantity to exactly match the exchange!
+        dbRecord.longLeg.entryPrice = parseFloat(longPos.info?.entryPrice || longPos.entryPrice);
         dbRecord.longLeg.quantity = Math.abs(parseFloat(longPos.contracts));
         
         if (dbRecord.longLeg.status !== 'open') {
            dbRecord.longLeg.status = 'open';
-           const entryPrice = parseFloat(longPos.info.entryPrice);
+           const entryPrice = parseFloat(longPos.info?.entryPrice || longPos.entryPrice);
            const tpPriceRaw = Math.max(entryPrice * (1 + effectiveGridPercent), currentPrice * 1.0005);
            const qty = Math.abs(parseFloat(longPos.contracts));
            try {
@@ -374,13 +442,13 @@ class GridStrategyAgent {
            this.lastAppliedLongGrid = effectiveGridPercent;
            await dbRecord.save();
         } else {
-           // --- DYNAMIC GRID UPDATING (Phase 8 + Round 6 Significance Threshold) ---
-           const expectedTp = parseFloat(longPos.info.entryPrice) * (1 + effectiveGridPercent);
+           // Dynamic Grid Updating
+           const expectedTp = parseFloat(longPos.info?.entryPrice || longPos.entryPrice) * (1 + effectiveGridPercent);
            const lastGrid = this.lastAppliedLongGrid || effectiveGridPercent;
            const gridShift = Math.abs(effectiveGridPercent - lastGrid) / lastGrid;
            const threshold = (this.settings.useDynamicGrid !== false) ? 0.15 : 0.0001;
            const deviation = (this.settings.useDynamicGrid !== false) ? gridShift : Math.abs(dbRecord.longLeg.takeProfitPrice - expectedTp) / expectedTp;
-           if (deviation > threshold) {
+           if (deviation > threshold && expectedTp > 0) {
               console.log(`🔄 Grid shift detected! Adjusting LONG Take-Profit to ${expectedTp.toFixed(4)}...`);
               dbRecord.longLeg.takeProfitPrice = expectedTp;
               this.lastAppliedLongGrid = effectiveGridPercent;
@@ -395,96 +463,100 @@ class GridStrategyAgent {
            }
         }
         
-        // --- POSITION STOP-LOSS GUARD (Round 7 - Decoupled Hard Safety Stop) ---
+        // --- POSITION STOP-LOSS GUARD ---
         const stopLossPercent = this.settings.stopLossPercentage ?? 0.05;
         const currentLongDca = dbRecord.longLeg.dcaCount || 0;
         let longSlTriggered = false;
-        const isLongSlBreached = stopLossPercent > 0 && currentPrice <= dbRecord.longLeg.entryPrice * (1 - stopLossPercent);
+        const longEntry = dbRecord.longLeg.entryPrice;
+        const isLongSlBreached = stopLossPercent > 0 && longEntry > 0 && currentPrice <= longEntry * (1 - stopLossPercent);
 
         if (stopLossPercent > 0 && isLongSlBreached) {
-          const longSlPrice = dbRecord.longLeg.entryPrice * (1 - stopLossPercent);
+          const longSlPrice = longEntry * (1 - stopLossPercent);
           longSlTriggered = true;
           console.warn(`🚨 STOP-LOSS TRIGGERED FOR LONG LEG! Current: $${currentPrice}, SL: $${longSlPrice.toFixed(4)} (-${(stopLossPercent * 100).toFixed(1)}%)`);
-            try {
-              await binanceService.cancelOrdersBySide(symbol, 'LONG');
-              const closeOrder = await binanceService.placeHedgeOrder(symbol, 'SELL', 'LONG', Math.abs(parseFloat(longPos.contracts)), 'MARKET');
-              const exitPrice = closeOrder?.average || closeOrder?.price || currentPrice;
-              
-              const entry = dbRecord.longLeg.entryPrice;
-              const qty = Math.abs(parseFloat(longPos.contracts));
-              const grossPnl = (exitPrice - entry) * qty;
-              const fees = (entry * qty * 0.0005) + (exitPrice * qty * 0.0005);
-              const netPnl = grossPnl - fees;
-              
-              const historyRecord = new TradeHistory({
-                symbol: symbol,
-                side: 'LONG',
-                entryPrice: entry,
-                exitPrice: exitPrice,
-                quantity: qty,
-                grossPnl: grossPnl,
-                fees: fees,
-                netPnl: netPnl
-              });
-              await historyRecord.save();
-              console.log(`🛡️ LONG Stop-Loss executed. Realized Net PnL: $${netPnl.toFixed(4)}. Opposing SHORT remains active.`);
-              
-              dbRecord.longLeg.status = 'closed';
-              dbRecord.longLeg.entryPrice = null; // Clear so stopped-out leg does not anchor to stale pre-dump entry
-              dbRecord.longLeg.dcaCount = 0;
-              dbRecord.longLeg.lastDcaPrice = null;
-              dbRecord.longLeg.unrealizedPnl = 0;
-              dbRecord.longLeg.realizedPnl = netPnl;
-              await dbRecord.save();
-              longPos = null;
-            } catch (slErr) {
-              console.error(`❌ Failed to execute LONG stop loss:`, slErr.message);
-            }
+          try {
+            await binanceService.cancelOrdersBySide(symbol, 'LONG');
+            const closeOrder = await binanceService.placeHedgeOrder(symbol, 'SELL', 'LONG', Math.abs(parseFloat(longPos.contracts)), 'MARKET');
+            const exitPrice = closeOrder?.average || closeOrder?.price || currentPrice;
+            
+            const qty = Math.abs(parseFloat(longPos.contracts));
+            const grossPnl = (exitPrice - longEntry) * qty;
+            const fees = (longEntry * qty * 0.0005) + (exitPrice * qty * 0.0005);
+            const netPnl = grossPnl - fees;
+            
+            const historyRecord = new TradeHistory({
+              symbol: symbol,
+              side: 'LONG',
+              entryPrice: longEntry,
+              exitPrice: exitPrice,
+              quantity: qty,
+              grossPnl: isFinite(grossPnl) ? grossPnl : 0,
+              fees: isFinite(fees) ? fees : 0,
+              netPnl: isFinite(netPnl) ? netPnl : 0
+            });
+            await historyRecord.save();
+            console.log(`🛡️ LONG Stop-Loss executed. Realized Net PnL: $${netPnl.toFixed(4)}. Opposing SHORT remains active.`);
+            
+            dbRecord.longLeg.status = 'closed';
+            dbRecord.longLeg.entryPrice = null;
+            dbRecord.longLeg.dcaCount = 0;
+            dbRecord.longLeg.lastDcaPrice = null;
+            dbRecord.longLeg.unrealizedPnl = 0;
+            dbRecord.longLeg.realizedPnl = netPnl;
+            dbRecord.longLeg.stoppedOutAt = new Date(); // Enforce cooldown
+            await dbRecord.save();
+            longPos = null;
+          } catch (slErr) {
+            console.error(`❌ Failed to execute LONG stop loss:`, slErr.message);
           }
+        }
 
-        // --- DCA LOGIC (Phase 7 + Round 6/7 Persistent Spacing & Max Layers) ---
+        // --- DCA LOGIC ---
         if (!longSlTriggered && longPos) {
           const longAnchorPrice = dbRecord.longLeg.lastDcaPrice || dbRecord.longLeg.entryPrice;
-          const isLongDcaPriceMet = currentPrice <= longAnchorPrice * (1 - effectiveGridPercent);
+          const isLongDcaPriceMet = longAnchorPrice > 0 && currentPrice <= longAnchorPrice * (1 - effectiveGridPercent);
 
           if (tradingEnabled && canOpenNewPosition && currentLongDca < maxDcaLayers && isLongDcaPriceMet) {
             console.log(`📉 Price dropped below grid! DCA LONG leg (Layer ${currentLongDca + 1}/${maxDcaLayers})...`);
             try {
               const verifyPositions = await binanceService.fetchOpenPositions(symbol);
-              const verifyLong = verifyPositions.find(p => p.info.positionSide === 'LONG');
+              const verifyLong = verifyPositions.find(p => (p.info?.positionSide === 'LONG') || (p.side === 'long'));
               if (verifyLong && Math.abs(parseFloat(verifyLong.contracts)) > 0) {
-                  const freeMargin = await binanceService.getBalance();
-                  const requiredMargin = (quantityRaw * currentPrice) / leverage;
-                  if (freeMargin < requiredMargin * 1.05) {
-                    console.warn(`⚠️ DCA LONG skipped: Free margin ($${freeMargin.toFixed(2)}) is below required margin ($${requiredMargin.toFixed(2)}).`);
-                  } else {
-                    const dcaOrder = await binanceService.placeHedgeOrder(symbol, 'BUY', 'LONG', quantityRaw, 'MARKET');
-                    const fillPrice = dcaOrder?.average || dcaOrder?.price || currentPrice;
-                    dbRecord.longLeg.dcaCount = currentLongDca + 1;
-                    dbRecord.longLeg.lastDcaPrice = fillPrice;
-                    
-                    // Replace old Take-Profit order ONLY after DCA market fill is confirmed
+                const freeMargin = await binanceService.getBalance();
+                const requiredMargin = (quantityRaw * currentPrice) / leverage;
+                if (freeMargin < requiredMargin * 1.05) {
+                  console.warn(`⚠️ DCA LONG skipped: Free margin ($${freeMargin.toFixed(2)}) is below required margin ($${requiredMargin.toFixed(2)}).`);
+                } else {
+                  const dcaOrder = await binanceService.placeHedgeOrder(symbol, 'BUY', 'LONG', quantityRaw, 'MARKET');
+                  const fillPrice = dcaOrder?.average || dcaOrder?.price || currentPrice;
+                  
+                  // PERSIST DCA STATE IMMEDIATELY to prevent duplicate entries on network latency
+                  dbRecord.longLeg.dcaCount = currentLongDca + 1;
+                  dbRecord.longLeg.lastDcaPrice = fillPrice;
+                  await dbRecord.save();
+                  
+                  // Replace old Take-Profit order
+                  try {
                     await binanceService.cancelOrdersBySide(symbol, 'LONG');
                     const updatedPositions = await binanceService.fetchOpenPositions(symbol);
-                    const updatedLong = updatedPositions.find(p => p.info.positionSide === 'LONG');
+                    const updatedLong = updatedPositions.find(p => (p.info?.positionSide === 'LONG') || (p.side === 'long'));
                     if (updatedLong && Math.abs(parseFloat(updatedLong.contracts)) > 0) {
-                      const newEntry = parseFloat(updatedLong.info.entryPrice);
+                      const newEntry = parseFloat(updatedLong.info?.entryPrice || updatedLong.entryPrice);
                       const newQty = Math.abs(parseFloat(updatedLong.contracts));
                       const newTpPrice = Math.max(newEntry * (1 + effectiveGridPercent), currentPrice * 1.0005);
                       dbRecord.longLeg.entryPrice = newEntry;
                       dbRecord.longLeg.quantity = newQty;
                       dbRecord.longLeg.takeProfitPrice = newTpPrice;
                       this.lastAppliedLongGrid = effectiveGridPercent;
-                      try {
-                        await binanceService.placeHedgeOrder(symbol, 'SELL', 'LONG', newQty, 'LIMIT', newTpPrice);
-                      } catch (tpErr) {
-                        console.warn(`⚠️ DCA TP placement deferred to self-healing:`, tpErr.message);
-                      }
+                      await binanceService.placeHedgeOrder(symbol, 'SELL', 'LONG', newQty, 'LIMIT', newTpPrice);
+                      await dbRecord.save();
                     }
-                    await dbRecord.save();
+                  } catch (tpErr) {
+                    console.warn(`⚠️ DCA TP placement deferred to self-healing:`, tpErr.message);
                   }
+                }
               } else {
-                  console.warn(`🚨 DCA Aborted! Long position closed right before market order placement.`);
+                console.warn(`🚨 DCA Aborted! Long position closed right before market order placement.`);
               }
             } catch (dcaErr) {
               console.error(`❌ Failed to DCA LONG leg:`, dcaErr.message);
@@ -494,7 +566,7 @@ class GridStrategyAgent {
           }
           
           // Sync Live Net PnL to DB
-          dbRecord.longLeg.unrealizedPnl = calculateNetPnl(longPos.info.unRealizedProfit, parseFloat(longPos.info.entryPrice), Math.abs(parseFloat(longPos.contracts)));
+          dbRecord.longLeg.unrealizedPnl = calculateNetPnl(longPos.info?.unRealizedProfit, parseFloat(longPos.info?.entryPrice || longPos.entryPrice), Math.abs(parseFloat(longPos.contracts)));
         }
       }
       
@@ -509,7 +581,14 @@ class GridStrategyAgent {
         }
         this.lastAppliedShortGrid = null; // Reset grid tracking
 
-        if (tradingEnabled && canOpenNewPosition) {
+        // Stop-Loss Cooldown Guard: Prevents immediate knife-catching re-entry
+        const shortCooldownRemaining = dbRecord.shortLeg?.stoppedOutAt 
+          ? Math.max(0, STOP_LOSS_COOLDOWN_MS - (Date.now() - new Date(dbRecord.shortLeg.stoppedOutAt).getTime()))
+          : 0;
+
+        if (shortCooldownRemaining > 0) {
+          console.log(`⏳ SHORT leg is in Stop-Loss Cooldown (${Math.ceil(shortCooldownRemaining / 1000)}s left). Holding off re-entry.`);
+        } else if (tradingEnabled && canOpenNewPosition) {
           const existingShortSell = openOrders.find(o => o.info && o.info.positionSide === 'SHORT' && o.info.side === 'SELL' && (o.type && o.type.toLowerCase() === 'limit'));
           const prevEntry = dbRecord.shortLeg?.entryPrice;
 
@@ -520,13 +599,10 @@ class GridStrategyAgent {
               await binanceService.cancelOrdersBySide(symbol, 'SHORT');
               await this.executeMarketEntry('SHORT', symbol, quantityRaw, currentPrice, effectiveGridPercent, dbRecord);
             }
-            // Otherwise, patiently waiting for pullback to fill wholesale limit sell
           } else if (prevEntry && currentPrice <= prevEntry * (1 - effectiveGridPercent * 1.5)) {
-            // Direct Trend Breakout without first placing a stale resting limit miles above
             console.log(`🚀 SHORT Trend Breakout! Advancing grid immediately to current price...`);
             await this.executeMarketEntry('SHORT', symbol, quantityRaw, currentPrice, effectiveGridPercent, dbRecord);
           } else if (prevEntry && currentPrice < prevEntry) {
-            // Place Reload LIMIT Sell order back at wholesale base price
             console.log(`🎯 Setting SHORT Reload Limit Sell at $${prevEntry.toFixed(5)} (Current: $${currentPrice.toFixed(5)})...`);
             try {
               await binanceService.cancelOrdersBySide(symbol, 'SHORT');
@@ -547,13 +623,13 @@ class GridStrategyAgent {
           }
         }
       } else {
-        // ALWAYS self-heal entry price and quantity to exactly match the exchange! Eliminates precision/slippage drift.
-        dbRecord.shortLeg.entryPrice = parseFloat(shortPos.info.entryPrice);
+        // ALWAYS self-heal entry price and quantity to exactly match the exchange!
+        dbRecord.shortLeg.entryPrice = parseFloat(shortPos.info?.entryPrice || shortPos.entryPrice);
         dbRecord.shortLeg.quantity = Math.abs(parseFloat(shortPos.contracts));
         
         if (dbRecord.shortLeg.status !== 'open') {
            dbRecord.shortLeg.status = 'open';
-           const entryPrice = parseFloat(shortPos.info.entryPrice);
+           const entryPrice = parseFloat(shortPos.info?.entryPrice || shortPos.entryPrice);
            const tpPriceRaw = Math.min(entryPrice * (1 - effectiveGridPercent), currentPrice * 0.9995);
            const qty = Math.abs(parseFloat(shortPos.contracts));
            try {
@@ -566,13 +642,13 @@ class GridStrategyAgent {
            this.lastAppliedShortGrid = effectiveGridPercent;
            await dbRecord.save();
         } else {
-           // --- DYNAMIC GRID UPDATING (Phase 8 + Round 6 Significance Threshold) ---
-           const expectedTp = parseFloat(shortPos.info.entryPrice) * (1 - effectiveGridPercent);
+           // Dynamic Grid Updating
+           const expectedTp = parseFloat(shortPos.info?.entryPrice || shortPos.entryPrice) * (1 - effectiveGridPercent);
            const lastGrid = this.lastAppliedShortGrid || effectiveGridPercent;
            const gridShift = Math.abs(effectiveGridPercent - lastGrid) / lastGrid;
            const threshold = (this.settings.useDynamicGrid !== false) ? 0.15 : 0.0001;
            const deviation = (this.settings.useDynamicGrid !== false) ? gridShift : Math.abs(dbRecord.shortLeg.takeProfitPrice - expectedTp) / expectedTp;
-           if (deviation > threshold) {
+           if (deviation > threshold && expectedTp > 0) {
               console.log(`🔄 Grid shift detected! Adjusting SHORT Take-Profit to ${expectedTp.toFixed(4)}...`);
               dbRecord.shortLeg.takeProfitPrice = expectedTp;
               this.lastAppliedShortGrid = effectiveGridPercent;
@@ -587,96 +663,100 @@ class GridStrategyAgent {
            }
         }
         
-        // --- POSITION STOP-LOSS GUARD (Round 7 - Decoupled Hard Safety Stop) ---
+        // --- POSITION STOP-LOSS GUARD ---
         const stopLossPercent = this.settings.stopLossPercentage ?? 0.05;
         const currentShortDca = dbRecord.shortLeg.dcaCount || 0;
         let shortSlTriggered = false;
-        const isShortSlBreached = stopLossPercent > 0 && currentPrice >= dbRecord.shortLeg.entryPrice * (1 + stopLossPercent);
+        const shortEntry = dbRecord.shortLeg.entryPrice;
+        const isShortSlBreached = stopLossPercent > 0 && shortEntry > 0 && currentPrice >= shortEntry * (1 + stopLossPercent);
 
         if (stopLossPercent > 0 && isShortSlBreached) {
-          const shortSlPrice = dbRecord.shortLeg.entryPrice * (1 + stopLossPercent);
+          const shortSlPrice = shortEntry * (1 + stopLossPercent);
           shortSlTriggered = true;
           console.warn(`🚨 STOP-LOSS TRIGGERED FOR SHORT LEG! Current: $${currentPrice}, SL: $${shortSlPrice.toFixed(4)} (+${(stopLossPercent * 100).toFixed(1)}%)`);
-            try {
-              await binanceService.cancelOrdersBySide(symbol, 'SHORT');
-              const closeOrder = await binanceService.placeHedgeOrder(symbol, 'BUY', 'SHORT', Math.abs(parseFloat(shortPos.contracts)), 'MARKET');
-              const exitPrice = closeOrder?.average || closeOrder?.price || currentPrice;
-              
-              const entry = dbRecord.shortLeg.entryPrice;
-              const qty = Math.abs(parseFloat(shortPos.contracts));
-              const grossPnl = (entry - exitPrice) * qty;
-              const fees = (entry * qty * 0.0005) + (exitPrice * qty * 0.0005);
-              const netPnl = grossPnl - fees;
-              
-              const historyRecord = new TradeHistory({
-                symbol: symbol,
-                side: 'SHORT',
-                entryPrice: entry,
-                exitPrice: exitPrice,
-                quantity: qty,
-                grossPnl: grossPnl,
-                fees: fees,
-                netPnl: netPnl
-              });
-              await historyRecord.save();
-              console.log(`🛡️ SHORT Stop-Loss executed. Realized Net PnL: $${netPnl.toFixed(4)}. Opposing LONG remains active.`);
-              
-              dbRecord.shortLeg.status = 'closed';
-              dbRecord.shortLeg.entryPrice = null; // Clear so stopped-out leg does not anchor to stale pre-dump entry
-              dbRecord.shortLeg.dcaCount = 0;
-              dbRecord.shortLeg.lastDcaPrice = null;
-              dbRecord.shortLeg.unrealizedPnl = 0;
-              dbRecord.shortLeg.realizedPnl = netPnl;
-              await dbRecord.save();
-              shortPos = null;
-            } catch (slErr) {
-              console.error(`❌ Failed to execute SHORT stop loss:`, slErr.message);
-            }
+          try {
+            await binanceService.cancelOrdersBySide(symbol, 'SHORT');
+            const closeOrder = await binanceService.placeHedgeOrder(symbol, 'BUY', 'SHORT', Math.abs(parseFloat(shortPos.contracts)), 'MARKET');
+            const exitPrice = closeOrder?.average || closeOrder?.price || currentPrice;
+            
+            const qty = Math.abs(parseFloat(shortPos.contracts));
+            const grossPnl = (shortEntry - exitPrice) * qty;
+            const fees = (shortEntry * qty * 0.0005) + (exitPrice * qty * 0.0005);
+            const netPnl = grossPnl - fees;
+            
+            const historyRecord = new TradeHistory({
+              symbol: symbol,
+              side: 'SHORT',
+              entryPrice: shortEntry,
+              exitPrice: exitPrice,
+              quantity: qty,
+              grossPnl: isFinite(grossPnl) ? grossPnl : 0,
+              fees: isFinite(fees) ? fees : 0,
+              netPnl: isFinite(netPnl) ? netPnl : 0
+            });
+            await historyRecord.save();
+            console.log(`🛡️ SHORT Stop-Loss executed. Realized Net PnL: $${netPnl.toFixed(4)}. Opposing LONG remains active.`);
+            
+            dbRecord.shortLeg.status = 'closed';
+            dbRecord.shortLeg.entryPrice = null;
+            dbRecord.shortLeg.dcaCount = 0;
+            dbRecord.shortLeg.lastDcaPrice = null;
+            dbRecord.shortLeg.unrealizedPnl = 0;
+            dbRecord.shortLeg.realizedPnl = netPnl;
+            dbRecord.shortLeg.stoppedOutAt = new Date(); // Enforce cooldown
+            await dbRecord.save();
+            shortPos = null;
+          } catch (slErr) {
+            console.error(`❌ Failed to execute SHORT stop loss:`, slErr.message);
           }
+        }
 
-        // --- DCA LOGIC (Phase 7 + Round 6/7 Persistent Spacing & Max Layers) ---
+        // --- DCA LOGIC ---
         if (!shortSlTriggered && shortPos) {
           const shortAnchorPrice = dbRecord.shortLeg.lastDcaPrice || dbRecord.shortLeg.entryPrice;
-          const isShortDcaPriceMet = currentPrice >= shortAnchorPrice * (1 + effectiveGridPercent);
+          const isShortDcaPriceMet = shortAnchorPrice > 0 && currentPrice >= shortAnchorPrice * (1 + effectiveGridPercent);
 
           if (tradingEnabled && canOpenNewPosition && currentShortDca < maxDcaLayers && isShortDcaPriceMet) {
             console.log(`📈 Price pumped above grid! DCA SHORT leg (Layer ${currentShortDca + 1}/${maxDcaLayers})...`);
             try {
               const verifyPositions = await binanceService.fetchOpenPositions(symbol);
-              const verifyShort = verifyPositions.find(p => p.info.positionSide === 'SHORT');
+              const verifyShort = verifyPositions.find(p => (p.info?.positionSide === 'SHORT') || (p.side === 'short'));
               if (verifyShort && Math.abs(parseFloat(verifyShort.contracts)) > 0) {
-                  const freeMargin = await binanceService.getBalance();
-                  const requiredMargin = (quantityRaw * currentPrice) / leverage;
-                  if (freeMargin < requiredMargin * 1.05) {
-                    console.warn(`⚠️ DCA SHORT skipped: Free margin ($${freeMargin.toFixed(2)}) is below required margin ($${requiredMargin.toFixed(2)}).`);
-                  } else {
-                    const dcaOrder = await binanceService.placeHedgeOrder(symbol, 'SELL', 'SHORT', quantityRaw, 'MARKET');
-                    const fillPrice = dcaOrder?.average || dcaOrder?.price || currentPrice;
-                    dbRecord.shortLeg.dcaCount = currentShortDca + 1;
-                    dbRecord.shortLeg.lastDcaPrice = fillPrice;
-                    
-                    // Replace old Take-Profit order ONLY after DCA market fill is confirmed
+                const freeMargin = await binanceService.getBalance();
+                const requiredMargin = (quantityRaw * currentPrice) / leverage;
+                if (freeMargin < requiredMargin * 1.05) {
+                  console.warn(`⚠️ DCA SHORT skipped: Free margin ($${freeMargin.toFixed(2)}) is below required margin ($${requiredMargin.toFixed(2)}).`);
+                } else {
+                  const dcaOrder = await binanceService.placeHedgeOrder(symbol, 'SELL', 'SHORT', quantityRaw, 'MARKET');
+                  const fillPrice = dcaOrder?.average || dcaOrder?.price || currentPrice;
+                  
+                  // PERSIST DCA STATE IMMEDIATELY to prevent duplicate entries on network latency
+                  dbRecord.shortLeg.dcaCount = currentShortDca + 1;
+                  dbRecord.shortLeg.lastDcaPrice = fillPrice;
+                  await dbRecord.save();
+                  
+                  // Replace old Take-Profit order
+                  try {
                     await binanceService.cancelOrdersBySide(symbol, 'SHORT');
                     const updatedPositions = await binanceService.fetchOpenPositions(symbol);
-                    const updatedShort = updatedPositions.find(p => p.info.positionSide === 'SHORT');
+                    const updatedShort = updatedPositions.find(p => (p.info?.positionSide === 'SHORT') || (p.side === 'short'));
                     if (updatedShort && Math.abs(parseFloat(updatedShort.contracts)) > 0) {
-                      const newEntry = parseFloat(updatedShort.info.entryPrice);
+                      const newEntry = parseFloat(updatedShort.info?.entryPrice || updatedShort.entryPrice);
                       const newQty = Math.abs(parseFloat(updatedShort.contracts));
                       const newTpPrice = Math.min(newEntry * (1 - effectiveGridPercent), currentPrice * 0.9995);
                       dbRecord.shortLeg.entryPrice = newEntry;
                       dbRecord.shortLeg.quantity = newQty;
                       dbRecord.shortLeg.takeProfitPrice = newTpPrice;
                       this.lastAppliedShortGrid = effectiveGridPercent;
-                      try {
-                        await binanceService.placeHedgeOrder(symbol, 'BUY', 'SHORT', newQty, 'LIMIT', newTpPrice);
-                      } catch (tpErr) {
-                        console.warn(`⚠️ DCA TP placement deferred to self-healing:`, tpErr.message);
-                      }
+                      await binanceService.placeHedgeOrder(symbol, 'BUY', 'SHORT', newQty, 'LIMIT', newTpPrice);
+                      await dbRecord.save();
                     }
-                    await dbRecord.save();
+                  } catch (tpErr) {
+                    console.warn(`⚠️ DCA TP placement deferred to self-healing:`, tpErr.message);
                   }
+                }
               } else {
-                  console.warn(`🚨 DCA Aborted! Short position closed right before market order placement.`);
+                console.warn(`🚨 DCA Aborted! Short position closed right before market order placement.`);
               }
             } catch (dcaErr) {
               console.error(`❌ Failed to DCA SHORT leg:`, dcaErr.message);
@@ -686,7 +766,7 @@ class GridStrategyAgent {
           }
           
           // Sync Live Net PnL to DB
-          dbRecord.shortLeg.unrealizedPnl = calculateNetPnl(shortPos.info.unRealizedProfit, parseFloat(shortPos.info.entryPrice), Math.abs(parseFloat(shortPos.contracts)));
+          dbRecord.shortLeg.unrealizedPnl = calculateNetPnl(shortPos.info?.unRealizedProfit, parseFloat(shortPos.info?.entryPrice || shortPos.entryPrice), Math.abs(parseFloat(shortPos.contracts)));
         }
       }
 

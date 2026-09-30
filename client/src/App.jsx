@@ -18,7 +18,7 @@ function App() {
     ...settings,
     gridPercentage: settings.gridPercentage * 100,
     positionPercentage: settings.positionPercentage * 100,
-    stopLossPercentage: (settings.stopLossPercentage || 0.05) * 100
+    stopLossPercentage: (settings.stopLossPercentage ?? 0.05) * 100
   });
   const [saving, setSaving] = useState(false);
 
@@ -30,16 +30,16 @@ function App() {
         axios.get('/api/settings'),
         axios.get('/api/history')
       ]);
-      setStatus(statusRes.data);
+      setStatus(statusRes.data || { balance: 0, marginRatio: 0, totalRealizedPnl: 0 });
       // Only update grid positions from REST, leave livePrice to be handled by WebSocket or fallback
       setGridData(prev => ({
         ...gridRes.data,
-        livePrice: prev.livePrice || gridRes.data.livePrice
+        livePrice: prev.livePrice || gridRes.data?.livePrice
       }));
-      setTradeHistory(historyRes.data);
+      setTradeHistory(Array.isArray(historyRes.data) ? historyRes.data : []);
       
       // Only update local settings if modal is not open to avoid overwriting user input
-      if (!showSettings) {
+      if (!showSettings && settingsRes.data) {
         setSettings(settingsRes.data);
         setFormData({
           ...settingsRes.data,
@@ -78,24 +78,33 @@ function App() {
     e.preventDefault();
     setSaving(true);
     try {
+      const parsedStopLoss = parseFloat(formData.stopLossPercentage);
       const payload = {
         ...formData,
-        gridPercentage: formData.gridPercentage / 100,
-        positionPercentage: formData.positionPercentage / 100,
-        stopLossPercentage: formData.stopLossPercentage !== undefined ? formData.stopLossPercentage / 100 : 0.05
+        gridPercentage: parseFloat(formData.gridPercentage) / 100,
+        positionPercentage: parseFloat(formData.positionPercentage) / 100,
+        stopLossPercentage: !isNaN(parsedStopLoss) ? (parsedStopLoss / 100) : 0.05
       };
       await axios.post('/api/settings', payload);
       setShowSettings(false);
       fetchData(); // Refresh UI
     } catch (err) {
       console.error(err);
-      alert('Failed to save settings');
+      alert('Failed to save settings: ' + (err.response?.data?.error || err.message));
     } finally {
       setSaving(false);
     }
   };
 
-  const isMarginSafe = status.marginRatio < 80;
+  const isMarginSafe = (parseFloat(status.marginRatio) || 0) < 80;
+
+  const formatPrice = (p) => {
+    if (!p || isNaN(p)) return 'Loading...';
+    const num = parseFloat(p);
+    if (num >= 100) return `$${num.toFixed(2)}`;
+    if (num >= 1) return `$${num.toFixed(4)}`;
+    return `$${num.toFixed(5)}`;
+  };
 
   return (
     <div className="app-container">
@@ -109,7 +118,7 @@ function App() {
           <div className="stat-pill">
             <span className="stat-label">Live Price:</span>
             <span className="stat-value" style={{color: "var(--text-primary)"}}>
-              {gridData.livePrice ? `$${parseFloat(gridData.livePrice).toFixed(5)}` : 'Loading...'}
+              {formatPrice(gridData.livePrice)}
             </span>
           </div>
 
@@ -129,8 +138,8 @@ function App() {
 
           <div className="stat-pill">
             <span className="stat-label">Total PnL:</span>
-            <span className={`stat-value ${(status.totalRealizedPnl || 0) >= 0 ? 'safe' : 'danger'}`}>
-              {(status.totalRealizedPnl || 0) >= 0 ? '+' : ''}${parseFloat(status?.totalRealizedPnl || 0).toFixed(2)}
+            <span className={`stat-value ${(parseFloat(status.totalRealizedPnl) || 0) >= 0 ? 'safe' : 'danger'}`}>
+              {(parseFloat(status.totalRealizedPnl) || 0) >= 0 ? '+' : ''}${parseFloat(status?.totalRealizedPnl || 0).toFixed(2)}
             </span>
           </div>
 
@@ -150,13 +159,13 @@ function App() {
           <div className="grid-container">
             <GridLegCard 
               side="LONG" 
-              position={gridData.livePositions.long} 
+              position={gridData.livePositions?.long} 
               symbol={settings.symbol}
               maxDcaLayers={settings.maxDcaLayers ?? 3}
             />
             <GridLegCard 
               side="SHORT" 
-              position={gridData.livePositions.short} 
+              position={gridData.livePositions?.short} 
               symbol={settings.symbol}
               maxDcaLayers={settings.maxDcaLayers ?? 3}
             />
@@ -167,7 +176,7 @@ function App() {
         {!loading && (
           <div className="history-section">
             <h3 className="history-title">Recent Completed Trades</h3>
-            {tradeHistory.length === 0 ? (
+            {!Array.isArray(tradeHistory) || tradeHistory.length === 0 ? (
               <div className="empty-history">No completed trades yet.</div>
             ) : (
               <div className="table-responsive">
@@ -186,16 +195,16 @@ function App() {
                   <tbody>
                     {tradeHistory.map((trade, idx) => (
                       <tr key={trade._id || idx}>
-                        <td>{new Date(trade.closedAt).toLocaleTimeString()}</td>
+                        <td>{trade.closedAt ? new Date(trade.closedAt).toLocaleTimeString() : 'N/A'}</td>
                         <td>{trade.symbol}</td>
                         <td className={trade.side === 'LONG' ? 'text-green' : 'text-red'}>{trade.side}</td>
-                        <td>${Number(trade.entryPrice || 0).toFixed(5)}</td>
-                        <td>${Number(trade.exitPrice || 0).toFixed(5)}</td>
-                        <td className={(trade.grossPnl || 0) >= 0 ? 'text-green' : 'text-red'}>
-                          {(trade.grossPnl || 0) >= 0 ? '+' : ''}{Number(trade.grossPnl || 0).toFixed(4)}
+                        <td>{formatPrice(trade.entryPrice)}</td>
+                        <td>{formatPrice(trade.exitPrice)}</td>
+                        <td className={(parseFloat(trade.grossPnl) || 0) >= 0 ? 'text-green' : 'text-red'}>
+                          {(parseFloat(trade.grossPnl) || 0) >= 0 ? '+' : ''}{Number(trade.grossPnl || 0).toFixed(4)}
                         </td>
-                        <td className={(trade.netPnl || 0) >= 0 ? 'text-green' : 'text-red'} style={{fontWeight: 'bold'}}>
-                          {(trade.netPnl || 0) >= 0 ? '+' : ''}{Number(trade.netPnl || 0).toFixed(4)}
+                        <td className={(parseFloat(trade.netPnl) || 0) >= 0 ? 'text-green' : 'text-red'} style={{fontWeight: 'bold'}}>
+                          {(parseFloat(trade.netPnl) || 0) >= 0 ? '+' : ''}{Number(trade.netPnl || 0).toFixed(4)}
                         </td>
                       </tr>
                     ))}
@@ -236,8 +245,10 @@ function App() {
                 <input 
                   type="number" 
                   step="0.001"
+                  min="0.1"
+                  max="50"
                   value={formData.gridPercentage} 
-                  onChange={(e) => setFormData({...formData, gridPercentage: parseFloat(e.target.value)})}
+                  onChange={(e) => setFormData({...formData, gridPercentage: parseFloat(e.target.value) || 0})}
                   required
                 />
               </div>
@@ -247,9 +258,10 @@ function App() {
                 <input 
                   type="number" 
                   step="0.1"
+                  min="1"
                   max="50"
                   value={formData.positionPercentage} 
-                  onChange={(e) => setFormData({...formData, positionPercentage: parseFloat(e.target.value)})}
+                  onChange={(e) => setFormData({...formData, positionPercentage: parseFloat(e.target.value) || 0})}
                   required
                 />
               </div>
@@ -262,7 +274,7 @@ function App() {
                   min="1"
                   max="125"
                   value={formData.leverage} 
-                  onChange={(e) => setFormData({...formData, leverage: parseInt(e.target.value)})}
+                  onChange={(e) => setFormData({...formData, leverage: parseInt(e.target.value) || 1})}
                   required
                 />
               </div>
@@ -290,7 +302,7 @@ function App() {
                   min="0"
                   max="50"
                   value={formData.stopLossPercentage} 
-                  onChange={(e) => setFormData({...formData, stopLossPercentage: parseFloat(e.target.value)})}
+                  onChange={(e) => setFormData({...formData, stopLossPercentage: e.target.value === '' ? '' : parseFloat(e.target.value)})}
                   placeholder="e.g. 5.0 (0 to disable)"
                   required
                 />
@@ -322,3 +334,4 @@ function App() {
 }
 
 export default App;
+

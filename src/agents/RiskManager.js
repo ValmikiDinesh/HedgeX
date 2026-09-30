@@ -10,12 +10,12 @@ class RiskManager {
       const balanceObj = await binanceService.exchange.fetchBalance();
       const marginInfo = balanceObj?.info || {};
       
-      const totalMarginBalance = parseFloat(marginInfo.totalMarginBalance || 0);
-      const totalMaintMargin = parseFloat(marginInfo.totalMaintMargin || 0);
+      const totalMarginBalance = parseFloat(marginInfo.totalMarginBalance ?? balanceObj?.USDT?.total ?? 0);
+      const totalMaintMargin = parseFloat(marginInfo.totalMaintMargin ?? 0);
       
       if (isNaN(totalMarginBalance) || isNaN(totalMaintMargin)) {
-        console.warn('⚠️ Could not determine margin balance. Safely pausing trading with PANIC status.');
-        return 'PANIC'; // Safely abort if API fails to return margin info
+        console.warn('⚠️ Could not determine margin balance. Temporarily pausing trading for this tick.');
+        return 'PAUSE'; // Pause tick without triggering destructive panic close
       }
       
       let marginRatio = 0;
@@ -59,8 +59,8 @@ class RiskManager {
 
       return 'SAFE';
     } catch (err) {
-      console.error('❌ RiskManager Error:', err.message);
-      return 'PANIC'; // Default to PANIC if API fails so we don't accidentally trade blind
+      console.error('❌ RiskManager Balance Check Error:', err.message);
+      return 'PAUSE'; // Pause trading safely on transient API errors without wiping positions
     }
   }
 
@@ -84,45 +84,51 @@ class RiskManager {
     
     // 3. Market close each position
     for (const pos of positions) {
-      if (!pos.contracts || Math.abs(parseFloat(pos.contracts)) === 0) continue;
+      const contracts = Math.abs(parseFloat(pos.contracts || 0));
+      if (!contracts || contracts === 0) continue;
 
-      const isLong = pos.info.positionSide === 'LONG';
+      const posSideUpper = (pos.info?.positionSide || (pos.side ? pos.side.toUpperCase() : 'LONG')).toUpperCase();
+      const isLong = posSideUpper === 'LONG';
       const sideToClose = isLong ? 'SELL' : 'BUY';
       const positionSide = isLong ? 'LONG' : 'SHORT';
       
-      console.log(`🚨 Emergency Closing ${positionSide} position...`);
+      console.log(`🚨 Emergency Closing ${positionSide} position (${contracts} contracts)...`);
       try {
         await binanceService.placeHedgeOrder(
           symbol, 
           sideToClose, 
           positionSide, 
-          Math.abs(parseFloat(pos.contracts || 0)), 
+          contracts, 
           'MARKET'
         );
         
         // Log panic close loss to TradeHistory
-        const entryPrice = parseFloat(pos.info.entryPrice);
-        const qty = Math.abs(parseFloat(pos.contracts));
-        const unRealizedPnl = parseFloat(pos.info.unRealizedProfit || 0);
+        const entryPrice = parseFloat(pos.info?.entryPrice || pos.entryPrice || 0);
+        const unRealizedPnl = parseFloat(pos.info?.unRealizedProfit || pos.unrealizedPnl || 0);
         // Estimate fees: Taker on entry + Taker on exit (roughly 0.10% total)
-        const fees = qty * entryPrice * 0.001; 
+        const fees = entryPrice > 0 ? (contracts * entryPrice * 0.001) : 0; 
         const netPnl = unRealizedPnl - fees;
         
         // Fetch current price for exit price estimation (with safe fallback)
-        const ticker = await binanceService.exchange.fetchTicker(symbol).catch(() => ({ last: entryPrice }));
-        const currentPrice = ticker?.last || entryPrice;
+        let currentPrice = entryPrice;
+        try {
+          const ticker = await binanceService.exchange.fetchTicker(binanceService.toUnifiedSymbol(symbol));
+          currentPrice = ticker?.last || entryPrice;
+        } catch (_) {}
 
-        const historyRecord = new TradeHistory({
-          symbol: symbol,
-          side: positionSide,
-          entryPrice: entryPrice,
-          exitPrice: currentPrice,
-          quantity: qty,
-          grossPnl: unRealizedPnl,
-          fees: fees,
-          netPnl: netPnl
-        });
-        await historyRecord.save();
+        if (entryPrice > 0 && contracts > 0) {
+          const historyRecord = new TradeHistory({
+            symbol: symbol,
+            side: positionSide,
+            entryPrice: entryPrice,
+            exitPrice: currentPrice,
+            quantity: contracts,
+            grossPnl: isFinite(unRealizedPnl) ? unRealizedPnl : 0,
+            fees: isFinite(fees) ? fees : 0,
+            netPnl: isFinite(netPnl) ? netPnl : 0
+          });
+          await historyRecord.save();
+        }
         
         console.log(`✅ Emergency closed ${positionSide} successfully.`);
       } catch (err) {
@@ -130,15 +136,20 @@ class RiskManager {
       }
     }
     
-    // 3. Mark DB as closed so Strategy Agent doesn't mistakenly log phantom profits
+    // 4. Mark DB as closed so Strategy Agent doesn't mistakenly log phantom profits
     try {
       await HedgePosition.updateMany(
         { symbol: symbol, status: 'active' },
-        { $set: { status: 'closed' } }
+        { 
+          $set: { 
+            status: 'closed',
+            'longLeg.status': 'closed',
+            'shortLeg.status': 'closed'
+          } 
+        }
       );
     } catch (dbErr) {
       console.error(`❌ Failed to update DB state during panic:`, dbErr.message);
-      throw new Error(`Panic DB Update Failed: ${dbErr.message}`);
     }
     
     console.log(`🚨 Panic Sequence Complete. Account is flat.`);

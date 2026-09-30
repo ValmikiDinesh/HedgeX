@@ -6,9 +6,19 @@ const GridLegCard = ({ side, position, symbol, maxDcaLayers = 3 }) => {
   const isActive = position !== null && Math.abs(parseFloat(position.contracts || 0)) > 0;
   
   const Icon = isLong ? TrendingUp : TrendingDown;
-  const pnl = isActive ? parseFloat(position.netPnl) : 0;
+  const pnl = isActive ? (parseFloat(position.netPnl) || 0) : 0;
   const isProfit = pnl >= 0;
   const dcaCount = position?.dcaCount || 0;
+  const grossPnl = isActive ? (parseFloat(position.grossPnl) || 0) : 0;
+  const fees = isActive ? Math.abs(parseFloat(position.fees) || 0) : 0;
+
+  const formatPrice = (p) => {
+    if (!p || isNaN(p)) return '0.00';
+    const num = parseFloat(p);
+    if (num >= 100) return `$${num.toFixed(2)}`;
+    if (num >= 1) return `$${num.toFixed(4)}`;
+    return `$${num.toFixed(5)}`;
+  };
 
   return (
     <div className={`leg-card ${isLong ? 'long' : 'short'}`}>
@@ -39,13 +49,13 @@ const GridLegCard = ({ side, position, symbol, maxDcaLayers = 3 }) => {
           <>
             <div className="data-row">
               <span className="data-label">Avg. Entry Price</span>
-              <span className="data-value">${parseFloat(position.entryPrice || 0).toFixed(5)}</span>
+              <span className="data-value">{formatPrice(position.entryPrice)}</span>
             </div>
 
             {position.lastDcaPrice && (
               <div className="data-row">
                 <span className="data-label">Last DCA Price</span>
-                <span className="data-value">${parseFloat(position.lastDcaPrice).toFixed(5)}</span>
+                <span className="data-value">{formatPrice(position.lastDcaPrice)}</span>
               </div>
             )}
 
@@ -57,15 +67,15 @@ const GridLegCard = ({ side, position, symbol, maxDcaLayers = 3 }) => {
             <div className="pnl-breakdown" style={{ marginTop: '1rem', padding: '1rem', background: 'rgba(0,0,0,0.2)', borderRadius: '8px' }}>
               <div className="data-row" style={{ marginBottom: '8px' }}>
                 <span className="data-label">Gross PnL</span>
-                <span className="data-value" style={{ color: position.grossPnl >= 0 ? 'var(--profit-green)' : 'var(--loss-red)' }}>
-                  {position.grossPnl >= 0 ? '+' : ''}{position.grossPnl} USDT
+                <span className="data-value" style={{ color: grossPnl >= 0 ? 'var(--profit-green)' : 'var(--loss-red)' }}>
+                  {grossPnl >= 0 ? '+' : ''}{grossPnl.toFixed(4)} USDT
                 </span>
               </div>
               
               <div className="data-row" style={{ marginBottom: '8px' }}>
                 <span className="data-label">Est. Fees</span>
                 <span className="data-value" style={{ color: 'var(--loss-red)' }}>
-                  -{position.fees} USDT
+                  -{fees.toFixed(4)} USDT
                 </span>
               </div>
               
@@ -89,3 +99,4 @@ const GridLegCard = ({ side, position, symbol, maxDcaLayers = 3 }) => {
 };
 
 export default GridLegCard;
+

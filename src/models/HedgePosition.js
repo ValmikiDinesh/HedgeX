@@ -11,7 +11,8 @@ const legSchema = new mongoose.Schema({
   lastDcaPrice: { type: Number },
   reloadPrice: { type: Number },
   unrealizedPnl: { type: Number, default: 0 },
-  realizedPnl: { type: Number, default: 0 }
+  realizedPnl: { type: Number, default: 0 },
+  stoppedOutAt: { type: Date }
 });
 
 const hedgePositionSchema = new mongoose.Schema({
