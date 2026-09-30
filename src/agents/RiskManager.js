@@ -97,7 +97,7 @@ class RiskManager {
       
       console.log(`🚨 Emergency Closing ${positionSide} position (${contracts} contracts)...`);
       try {
-        await binanceService.placeHedgeOrder(
+        const closeOrder = await binanceService.placeHedgeOrder(
           symbol, 
           sideToClose, 
           positionSide, 
@@ -106,15 +106,23 @@ class RiskManager {
         );
         
         const entryPrice = parseFloat(pos.info?.entryPrice || pos.entryPrice || 0);
-        const unRealizedPnl = parseFloat(pos.info?.unRealizedProfit || pos.unrealizedPnl || 0);
-        const fees = (entryPrice > 0 && contracts > 0) ? (contracts * entryPrice * 0.001) : 0; 
-        const netPnl = unRealizedPnl - fees;
+        let currentPrice = parseFloat(closeOrder?.average || closeOrder?.price || 0);
+        if (!currentPrice || currentPrice <= 0) {
+          try {
+            const ticker = await binanceService.exchange.fetchTicker(binanceService.toUnifiedSymbol(symbol));
+            currentPrice = ticker?.last || entryPrice;
+          } catch (_) {
+            currentPrice = entryPrice;
+          }
+        }
         
-        let currentPrice = entryPrice;
-        try {
-          const ticker = await binanceService.exchange.fetchTicker(binanceService.toUnifiedSymbol(symbol));
-          currentPrice = ticker?.last || entryPrice;
-        } catch (_) {}
+        const grossPnl = isLong 
+          ? (currentPrice - entryPrice) * contracts 
+          : (entryPrice - currentPrice) * contracts;
+        const fees = (entryPrice > 0 && contracts > 0) 
+          ? (contracts * entryPrice * 0.0005) + (contracts * currentPrice * 0.0005) 
+          : 0; 
+        const netPnl = grossPnl - fees;
 
         if (entryPrice > 0 && contracts > 0) {
           const historyRecord = new TradeHistory({
@@ -123,7 +131,7 @@ class RiskManager {
             entryPrice: entryPrice,
             exitPrice: currentPrice,
             quantity: contracts,
-            grossPnl: isFinite(unRealizedPnl) ? unRealizedPnl : 0,
+            grossPnl: isFinite(grossPnl) ? grossPnl : 0,
             fees: isFinite(fees) ? fees : 0,
             netPnl: isFinite(netPnl) ? netPnl : 0
           });
@@ -138,8 +146,10 @@ class RiskManager {
     
     // 4. Mark DB active positions as closed
     try {
+      const rawSym = binanceService.toRawSymbol(symbol);
+      const unifiedSym = binanceService.toUnifiedSymbol(symbol);
       await HedgePosition.updateMany(
-        { symbol: symbol, status: 'active' },
+        { symbol: { $in: [symbol, rawSym, unifiedSym] }, status: 'active' },
         { 
           $set: { 
             status: 'closed',

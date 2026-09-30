@@ -61,6 +61,15 @@ const GridLegCard = ({ side, position, symbol, maxDcaLayers = 3 }) => {
               </div>
             )}
 
+            {position.stopLossPrice && (
+              <div className="data-row">
+                <span className="data-label">Stop-Loss Guard</span>
+                <span className="data-value" style={{ color: 'var(--loss-red)', fontWeight: '600' }}>
+                  {formatPrice(position.stopLossPrice)}
+                </span>
+              </div>
+            )}
+
             {position.lastDcaPrice && (
               <div className="data-row">
                 <span className="data-label">Last DCA Price</span>

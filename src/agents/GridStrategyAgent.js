@@ -62,12 +62,18 @@ class GridStrategyAgent {
         }
       }
 
+      const stopLossPercent = this.settings?.stopLossPercentage ?? 0.05;
+      const stopLossPrice = stopLossPercent > 0 
+        ? (isLong ? executionPrice * (1 - stopLossPercent) : executionPrice * (1 + stopLossPercent))
+        : null;
+
       dbRecord[legKey] = {
         exchangeOrderId: entryOrder?.id || 'manual_entry',
         status: 'open',
         entryPrice: executionPrice,
         quantity: filledQty,
         takeProfitPrice: tpPriceRaw,
+        stopLossPrice: stopLossPrice,
         dcaCount: 0,
         lastDcaPrice: null,
         unrealizedPnl: 0,
@@ -243,7 +249,8 @@ class GridStrategyAgent {
           }
           
           let grossPnl = (side === 'LONG') ? (exit - entry) * qty : (entry - exit) * qty;
-          const fees = (entry * qty * 0.0005) + (exit * qty * 0.0002);
+          const exitFeeRate = (nominalExit && Math.abs(exit - nominalExit) < 0.0001) ? 0.0002 : 0.0005;
+          const fees = (entry * qty * 0.0005) + (exit * qty * exitFeeRate);
           const netPnl = grossPnl - fees;
           
           console.log(`💰 ${side} Trade Closed! Realized Net PnL: $${netPnl.toFixed(4)} (Entry: $${entry}, Exit: $${exit.toFixed(5)})`);
@@ -393,6 +400,20 @@ class GridStrategyAgent {
       const quantityRaw = currentPrice > 0 ? (notionalSize / currentPrice) : 0;
       const minNotional = 5.0 / Math.max(0.1, (1 - effectiveGridPercent));
       const canOpenNewPosition = notionalSize >= minNotional && quantityRaw > 0 && balance > 0 && !isMarginWarning;
+
+      if (tradingEnabled && !canOpenNewPosition) {
+        const now = Date.now();
+        if (now - (this._lastNotionalWarnTime || 0) > 60000) {
+          if (balance <= 0) {
+            console.warn(`⚠️ Cannot open position: Wallet balance is $${balance.toFixed(2)}. Please ensure account has USDT futures balance.`);
+          } else if (notionalSize < minNotional) {
+            console.warn(`⚠️ Cannot open position: Allocated notional ($${notionalSize.toFixed(2)}) is below minimum required notional ($${minNotional.toFixed(2)}). Consider increasing position percentage or leverage in Settings.`);
+          } else if (isMarginWarning) {
+            console.warn(`⚠️ Cannot open position: Margin ratio warning active. Preserving capital.`);
+          }
+          this._lastNotionalWarnTime = now;
+        }
+      }
 
       // 11. Grid Replenishment Logic - LONG
       if (!longPos || Math.abs(parseFloat(longPos.contracts ?? longPos.info?.positionAmt ?? 0)) === 0) {
@@ -599,9 +620,11 @@ class GridStrategyAgent {
                       const newEntry = parseFloat(updatedLong.info?.entryPrice || updatedLong.entryPrice || 0);
                       const newQty = Math.abs(parseFloat(updatedLong.contracts ?? updatedLong.info?.positionAmt ?? 0));
                       const newTpPrice = Math.max(newEntry * (1 + effectiveGridPercent), currentPrice * 1.0005);
+                      const stopLossPercent = this.settings?.stopLossPercentage ?? 0.05;
                       dbRecord.longLeg.entryPrice = newEntry;
                       dbRecord.longLeg.quantity = newQty;
                       dbRecord.longLeg.takeProfitPrice = newTpPrice;
+                      dbRecord.longLeg.stopLossPrice = stopLossPercent > 0 ? newEntry * (1 - stopLossPercent) : null;
                       this.lastAppliedLongGrid = effectiveGridPercent;
                       await binanceService.placeHedgeOrder(symbol, 'SELL', 'LONG', newQty, 'LIMIT', newTpPrice);
                       await dbRecord.save();
@@ -825,9 +848,11 @@ class GridStrategyAgent {
                       const newEntry = parseFloat(updatedShort.info?.entryPrice || updatedShort.entryPrice || 0);
                       const newQty = Math.abs(parseFloat(updatedShort.contracts ?? updatedShort.info?.positionAmt ?? 0));
                       const newTpPrice = Math.min(newEntry * (1 - effectiveGridPercent), currentPrice * 0.9995);
+                      const stopLossPercent = this.settings?.stopLossPercentage ?? 0.05;
                       dbRecord.shortLeg.entryPrice = newEntry;
                       dbRecord.shortLeg.quantity = newQty;
                       dbRecord.shortLeg.takeProfitPrice = newTpPrice;
+                      dbRecord.shortLeg.stopLossPrice = stopLossPercent > 0 ? newEntry * (1 + stopLossPercent) : null;
                       this.lastAppliedShortGrid = effectiveGridPercent;
                       await binanceService.placeHedgeOrder(symbol, 'BUY', 'SHORT', newQty, 'LIMIT', newTpPrice);
                       await dbRecord.save();

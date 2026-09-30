@@ -127,6 +127,7 @@ app.get('/api/grid', async (req, res) => {
         contracts: qty,
         entryPrice: entryPrice,
         takeProfitPrice: legDb?.takeProfitPrice || null,
+        stopLossPrice: legDb?.stopLossPrice || null,
         dcaCount: legDb?.dcaCount || 0,
         lastDcaPrice: legDb?.lastDcaPrice || null,
         grossPnl: isFinite(grossPnl) ? grossPnl.toFixed(4) : "0.0000",
