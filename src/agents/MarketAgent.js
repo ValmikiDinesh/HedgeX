@@ -37,7 +37,7 @@ class MarketAgent extends EventEmitter {
           const now = Date.now();
           if (now - this.lastPriceTimestamp > 12000) {
             try {
-              const freshPrice = await this.getCurrentPrice(this.currentSymbol);
+              const freshPrice = await this.getCurrentPrice(this.currentSymbol, true);
               if (freshPrice && freshPrice > 0) {
                 this.emit('price_tick', freshPrice);
               }
@@ -109,7 +109,7 @@ class MarketAgent extends EventEmitter {
     }
   }
 
-  async getCurrentPrice(symbol) {
+  async getCurrentPrice(symbol, forceRefresh = false) {
     if (!symbol) return this.livePrice;
     const unifiedSymbol = binanceService.toUnifiedSymbol(symbol);
     const rawSymbol = binanceService.toRawSymbol(symbol);
@@ -119,8 +119,8 @@ class MarketAgent extends EventEmitter {
     }
     
     const now = Date.now();
-    // Return cached price ONLY if fresh (less than 15 seconds old) and symbol matches
-    if (this.livePrice !== null && (this._livePriceSymbol === unifiedSymbol || this._livePriceSymbol === rawSymbol) && (now - this.lastPriceTimestamp < 15000)) {
+    // Return cached price ONLY if fresh (less than 15 seconds old), symbol matches, and not force refreshing
+    if (!forceRefresh && this.livePrice !== null && (this._livePriceSymbol === unifiedSymbol || this._livePriceSymbol === rawSymbol) && (now - this.lastPriceTimestamp < 15000)) {
       return this.livePrice;
     }
     

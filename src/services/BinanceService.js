@@ -195,7 +195,7 @@ class BinanceService {
   async getBalance() {
     try {
       const balance = await this.exchange.fetchBalance();
-      return parseFloat(balance?.USDT?.free || 0);
+      return parseFloat(balance?.USDT?.free ?? balance?.info?.availableBalance ?? 0);
     } catch (err) {
       const now = Date.now();
       if (!this._lastBalanceError || now - this._lastBalanceError > 60000) {
@@ -209,7 +209,7 @@ class BinanceService {
   async getTotalWalletBalance() {
     try {
       const balance = await this.exchange.fetchBalance();
-      return parseFloat(balance.info?.totalWalletBalance || balance?.USDT?.total || 0);
+      return parseFloat(balance.info?.totalWalletBalance ?? balance?.USDT?.total ?? balance.info?.totalMarginBalance ?? 0);
     } catch (err) {
       const now = Date.now();
       if (!this._lastBalanceError || now - this._lastBalanceError > 60000) {

@@ -230,6 +230,20 @@ function App() {
       }
     }
 
+    const lev = parseInt(formData.leverage);
+    if (isNaN(lev) || lev < 1 || lev > 125) {
+      setSaveError('Leverage must be between 1x and 125x');
+      setSaving(false);
+      return;
+    }
+
+    const dcaL = parseInt(formData.maxDcaLayers);
+    if (isNaN(dcaL) || dcaL < 0 || dcaL > 10) {
+      setSaveError('Max DCA layers must be between 0 and 10');
+      setSaving(false);
+      return;
+    }
+
     try {
       const parsedStopLoss = parseFloat(formData.stopLossPercentage);
       const payload = {
@@ -271,7 +285,8 @@ function App() {
     const num = parseFloat(p);
     if (num >= 1000) return `$${num.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
     if (num >= 1) return `$${num.toFixed(4)}`;
-    return `$${num.toFixed(5)}`;
+    if (num >= 0.01) return `$${num.toFixed(5)}`;
+    return `$${num.toFixed(7)}`;
   };
 
   return (

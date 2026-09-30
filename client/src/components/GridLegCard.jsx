@@ -17,7 +17,8 @@ const GridLegCard = ({ side, position, symbol, maxDcaLayers = 3 }) => {
     const num = parseFloat(p);
     if (num >= 1000) return `$${num.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
     if (num >= 1) return `$${num.toFixed(4)}`;
-    return `$${num.toFixed(5)}`;
+    if (num >= 0.01) return `$${num.toFixed(5)}`;
+    return `$${num.toFixed(7)}`;
   };
 
   return (
