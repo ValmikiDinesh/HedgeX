@@ -78,26 +78,33 @@ function App() {
 
   const fetchData = async () => {
     try {
-      const [statusRes, gridRes, settingsRes, historyRes] = await Promise.all([
+      const [statusRes, gridRes, settingsRes, historyRes] = await Promise.allSettled([
         axios.get('/api/status'),
         axios.get('/api/grid'),
         axios.get('/api/settings'),
         axios.get('/api/history')
       ]);
 
-      setStatus(statusRes.data || { balance: 0, marginRatio: 0, totalRealizedPnl: 0 });
+      if (statusRes.status === 'fulfilled' && statusRes.value?.data) {
+        setStatus(statusRes.value.data);
+      }
       
-      setGridData(prev => ({
-        ...gridRes.data,
-        livePrice: (gridRes.data?.livePrice !== null && gridRes.data?.livePrice !== undefined) 
-          ? gridRes.data.livePrice 
-          : prev.livePrice
-      }));
+      if (gridRes.status === 'fulfilled' && gridRes.value?.data) {
+        const gd = gridRes.value.data;
+        setGridData(prev => ({
+          ...gd,
+          livePrice: (gd.livePrice !== null && gd.livePrice !== undefined) 
+            ? gd.livePrice 
+            : prev.livePrice
+        }));
+      }
 
-      setTradeHistory(Array.isArray(historyRes.data) ? historyRes.data : []);
+      if (historyRes.status === 'fulfilled' && Array.isArray(historyRes.value?.data)) {
+        setTradeHistory(historyRes.value.data);
+      }
       
-      if (!showSettings && settingsRes.data) {
-        const s = settingsRes.data;
+      if (!showSettings && settingsRes.status === 'fulfilled' && settingsRes.value?.data) {
+        const s = settingsRes.value.data;
         setSettings(s);
         setFormData({
           symbol: s.symbol || 'DOGEUSDT',

@@ -155,7 +155,11 @@ class RiskManager {
           $set: { 
             status: 'closed',
             'longLeg.status': 'closed',
-            'shortLeg.status': 'closed'
+            'longLeg.takeProfitPrice': null,
+            'longLeg.stopLossPrice': null,
+            'shortLeg.status': 'closed',
+            'shortLeg.takeProfitPrice': null,
+            'shortLeg.stopLossPrice': null
           } 
         }
       );

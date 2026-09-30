@@ -51,9 +51,9 @@ app.get('/api/status', async (req, res) => {
     let marginRatio = 0;
     try {
       const balanceObj = await binanceService.exchange.fetchBalance();
-      balance = parseFloat(balanceObj?.USDT?.free || 0);
+      balance = parseFloat(balanceObj?.USDT?.free ?? balanceObj?.info?.availableBalance ?? 0);
       const marginInfo = balanceObj?.info || {};
-      const totalMarginBalance = parseFloat(marginInfo.totalMarginBalance || balanceObj?.USDT?.total || 0);
+      const totalMarginBalance = parseFloat(marginInfo.totalMarginBalance ?? balanceObj?.USDT?.total ?? marginInfo.totalWalletBalance ?? 0);
       const totalMaintMargin = parseFloat(marginInfo.totalMaintMargin || 0);
       if (totalMarginBalance > 0) {
         marginRatio = (totalMaintMargin / totalMarginBalance) * 100;
