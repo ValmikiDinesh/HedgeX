@@ -215,6 +215,12 @@ app.post('/api/settings', async (req, res) => {
       }
     }
 
+    if (updates.minGridPercentage !== undefined && updates.maxGridPercentage !== undefined) {
+      if (updates.minGridPercentage >= updates.maxGridPercentage) {
+        return res.status(400).json({ error: 'Minimum grid spacing must be strictly less than maximum grid spacing' });
+      }
+    }
+
     if (updates.maxDcaLayers !== undefined) {
       updates.maxDcaLayers = parseInt(updates.maxDcaLayers);
       if (isNaN(updates.maxDcaLayers) || updates.maxDcaLayers < 0 || updates.maxDcaLayers > 10) {

@@ -399,12 +399,14 @@ class GridStrategyAgent {
           dbRecord.longLeg.status = 'closed';
           dbRecord.longLeg.dcaCount = 0;
           dbRecord.longLeg.lastDcaPrice = null;
+          await binanceService.cancelOrdersBySide(symbol, 'LONG').catch(() => {});
           await dbRecord.save();
         }
         this.lastAppliedLongGrid = null;
 
-        const longCooldownRemaining = dbRecord.longLeg?.stoppedOutAt 
-          ? Math.max(0, STOP_LOSS_COOLDOWN_MS - (Date.now() - new Date(dbRecord.longLeg.stoppedOutAt).getTime()))
+        const stoppedTimeLong = dbRecord.longLeg?.stoppedOutAt ? new Date(dbRecord.longLeg.stoppedOutAt).getTime() : 0;
+        const longCooldownRemaining = (!isNaN(stoppedTimeLong) && stoppedTimeLong > 0)
+          ? Math.max(0, STOP_LOSS_COOLDOWN_MS - (Date.now() - stoppedTimeLong))
           : 0;
 
         if (longCooldownRemaining > 0) {
@@ -443,8 +445,10 @@ class GridStrategyAgent {
           }
         }
       } else {
-        dbRecord.longLeg.entryPrice = parseFloat(longPos.info?.entryPrice || longPos.entryPrice || 0);
-        dbRecord.longLeg.quantity = Math.abs(parseFloat(longPos.contracts ?? longPos.info?.positionAmt ?? 0));
+        const currentPosEntry = parseFloat(longPos.info?.entryPrice || longPos.entryPrice || 0);
+        if (currentPosEntry > 0) dbRecord.longLeg.entryPrice = currentPosEntry;
+        const currentPosQty = Math.abs(parseFloat(longPos.contracts ?? longPos.info?.positionAmt ?? 0));
+        if (currentPosQty > 0) dbRecord.longLeg.quantity = currentPosQty;
         
         if (dbRecord.longLeg.status !== 'open') {
            dbRecord.longLeg.status = 'open';
@@ -462,8 +466,8 @@ class GridStrategyAgent {
            await dbRecord.save();
         } else {
            const expectedTp = parseFloat(longPos.info?.entryPrice || longPos.entryPrice || 0) * (1 + effectiveGridPercent);
-           const lastGrid = this.lastAppliedLongGrid || effectiveGridPercent;
-           const gridShift = Math.abs(effectiveGridPercent - lastGrid) / lastGrid;
+           const lastGrid = (this.lastAppliedLongGrid && this.lastAppliedLongGrid > 0) ? this.lastAppliedLongGrid : effectiveGridPercent;
+           const gridShift = lastGrid > 0 ? Math.abs(effectiveGridPercent - lastGrid) / lastGrid : 0;
            const threshold = (this.settings.useDynamicGrid !== false) ? 0.15 : 0.0001;
            const deviation = (this.settings.useDynamicGrid !== false) ? gridShift : Math.abs(dbRecord.longLeg.takeProfitPrice - expectedTp) / expectedTp;
            if (deviation > threshold && expectedTp > 0) {
@@ -587,12 +591,14 @@ class GridStrategyAgent {
           dbRecord.shortLeg.status = 'closed';
           dbRecord.shortLeg.dcaCount = 0;
           dbRecord.shortLeg.lastDcaPrice = null;
+          await binanceService.cancelOrdersBySide(symbol, 'SHORT').catch(() => {});
           await dbRecord.save();
         }
         this.lastAppliedShortGrid = null;
 
-        const shortCooldownRemaining = dbRecord.shortLeg?.stoppedOutAt 
-          ? Math.max(0, STOP_LOSS_COOLDOWN_MS - (Date.now() - new Date(dbRecord.shortLeg.stoppedOutAt).getTime()))
+        const stoppedTimeShort = dbRecord.shortLeg?.stoppedOutAt ? new Date(dbRecord.shortLeg.stoppedOutAt).getTime() : 0;
+        const shortCooldownRemaining = (!isNaN(stoppedTimeShort) && stoppedTimeShort > 0)
+          ? Math.max(0, STOP_LOSS_COOLDOWN_MS - (Date.now() - stoppedTimeShort))
           : 0;
 
         if (shortCooldownRemaining > 0) {
@@ -631,8 +637,10 @@ class GridStrategyAgent {
           }
         }
       } else {
-        dbRecord.shortLeg.entryPrice = parseFloat(shortPos.info?.entryPrice || shortPos.entryPrice || 0);
-        dbRecord.shortLeg.quantity = Math.abs(parseFloat(shortPos.contracts ?? shortPos.info?.positionAmt ?? 0));
+        const currentShortPosEntry = parseFloat(shortPos.info?.entryPrice || shortPos.entryPrice || 0);
+        if (currentShortPosEntry > 0) dbRecord.shortLeg.entryPrice = currentShortPosEntry;
+        const currentShortPosQty = Math.abs(parseFloat(shortPos.contracts ?? shortPos.info?.positionAmt ?? 0));
+        if (currentShortPosQty > 0) dbRecord.shortLeg.quantity = currentShortPosQty;
         
         if (dbRecord.shortLeg.status !== 'open') {
            dbRecord.shortLeg.status = 'open';
@@ -650,10 +658,10 @@ class GridStrategyAgent {
            await dbRecord.save();
         } else {
            const expectedTp = parseFloat(shortPos.info?.entryPrice || shortPos.entryPrice || 0) * (1 - effectiveGridPercent);
-           const lastGrid = this.lastAppliedShortGrid || effectiveGridPercent;
-           const gridShift = Math.abs(effectiveGridPercent - lastGrid) / lastGrid;
+           const lastGridShort = (this.lastAppliedShortGrid && this.lastAppliedShortGrid > 0) ? this.lastAppliedShortGrid : effectiveGridPercent;
+           const gridShiftShort = lastGridShort > 0 ? Math.abs(effectiveGridPercent - lastGridShort) / lastGridShort : 0;
            const threshold = (this.settings.useDynamicGrid !== false) ? 0.15 : 0.0001;
-           const deviation = (this.settings.useDynamicGrid !== false) ? gridShift : Math.abs(dbRecord.shortLeg.takeProfitPrice - expectedTp) / expectedTp;
+           const deviation = (this.settings.useDynamicGrid !== false) ? gridShiftShort : Math.abs(dbRecord.shortLeg.takeProfitPrice - expectedTp) / expectedTp;
            if (deviation > threshold && expectedTp > 0) {
               dbRecord.shortLeg.takeProfitPrice = expectedTp;
               this.lastAppliedShortGrid = effectiveGridPercent;

@@ -8,6 +8,7 @@ class BinanceService {
       apiKey: process.env.BINANCE_API_KEY,
       secret: process.env.BINANCE_API_SECRET,
       enableRateLimit: true,
+      timeout: 15000,
       has: {
         fetchCurrencies: false,
       },
@@ -71,7 +72,7 @@ class BinanceService {
       console.log('✅ Exchange Markets Loaded (Precision Data OK)');
       
       const response = await this.exchange.fapiPrivateGetPositionSideDual();
-      const isHedgeMode = response.dualSidePosition;
+      const isHedgeMode = Boolean(response?.dualSidePosition === true || response?.dualSidePosition === 'true');
       
       if (!isHedgeMode) {
         console.log('Switching account to Hedge Mode (Dual-Side Position)...');
@@ -105,6 +106,11 @@ class BinanceService {
       const quantity = this.exchange.amountToPrecision(targetSymbol, quantityRaw);
       if (!quantity || parseFloat(quantity) <= 0) {
         throw new Error(`Invalid order quantity (${quantityRaw} rounded to ${quantity}) for ${targetSymbol}`);
+      }
+
+      const market = this.exchange.markets ? this.exchange.markets[targetSymbol] : null;
+      if (market?.limits?.amount?.min && parseFloat(quantity) < market.limits.amount.min) {
+        throw new Error(`Order quantity ${quantity} is below exchange minimum of ${market.limits.amount.min} for ${targetSymbol}`);
       }
       
       let order;
