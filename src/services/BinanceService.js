@@ -312,7 +312,9 @@ class BinanceService {
       const matchingOrders = openOrders.filter(o => {
         if (!o.info) return false;
         if (positionSide === 'BOTH') return true;
-        return o.info.positionSide === positionSide;
+        if (o.info.positionSide === positionSide) return true;
+        if (this.isOneWayMode && o.info.positionSide === 'BOTH') return true;
+        return false;
       });
       if (matchingOrders.length === 0) return;
 

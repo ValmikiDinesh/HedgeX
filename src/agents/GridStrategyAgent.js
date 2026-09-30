@@ -253,20 +253,11 @@ class GridStrategyAgent {
           }
 
           // Accurate Exit Price Detection:
-          // If price reached the take profit level, it filled at nominalExit.
-          // If price is far away from TP (e.g. liquidated, stopped out, or manual close), use currentPrice.
-          let exit = currentPrice;
-          if (side === 'LONG') {
-            if (nominalExit && currentPrice >= nominalExit * 0.995) {
-              exit = nominalExit;
-            }
-          } else {
-            if (nominalExit && currentPrice <= nominalExit * 1.005) {
-              exit = nominalExit;
-            }
-          }
+          // The position disappeared from exchange because the resting Limit Take Profit order filled.
+          // Therefore, exit price is nominalExit. If nominalExit was not set (manual market close), fallback to currentPrice.
+          let exit = (nominalExit && nominalExit > 0) ? nominalExit : currentPrice;
           if (!exit || isNaN(exit) || exit <= 0) {
-            exit = nominalExit || entry;
+            exit = entry;
           }
           
           let rawGross = (side === 'LONG') ? (exit - entry) * qty : (entry - exit) * qty;
